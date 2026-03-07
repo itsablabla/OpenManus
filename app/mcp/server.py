@@ -97,33 +97,51 @@ class MCPServer:
         self.tools: Dict[str, Any] = {}
 
     def _load_tools(self) -> None:
-        """Deferred import and instantiation of all tools and agents."""
-        # These imports are slow (LLM config, Playwright, etc.) — keep them here
-        from app.logger import logger as _logger
-        self._logger = _logger
+        """Deferred import and instantiation of all tools and agents.
 
-        from app.tool.base import BaseTool
-        from app.tool.bash import Bash
-        from app.tool.str_replace_editor import StrReplaceEditor
-        from app.tool.terminate import Terminate
-        from app.agent.manus import Manus
-        from app.agent.data_analysis import DataAnalysis
-        from app.agent.swe import SWEAgent
-        from app.agent.browser import BrowserAgent
+        Uses try/except for each agent so that optional dependencies (e.g. daytona)
+        don't prevent the server from starting. Missing agents are skipped gracefully.
+        """
+        import logging as _logging
+        _log = _logging.getLogger(__name__)
+        self._logger = _log
+
         from app.mcp.agent_tool import AgentTool
 
         # --- High-level: Agent-as-a-Tool (stateless, isolated per call) ---
-        self.tools["run_manus"] = AgentTool(agent_class=Manus)
-        self.tools["run_data_analysis"] = AgentTool(agent_class=DataAnalysis)
-        self.tools["run_swe"] = AgentTool(agent_class=SWEAgent)
-        self.tools["run_browser"] = AgentTool(agent_class=BrowserAgent)
+        agent_map = {
+            "run_manus": ("app.agent.manus", "Manus"),
+            "run_data_analysis": ("app.agent.data_analysis", "DataAnalysis"),
+            "run_swe": ("app.agent.swe", "SWEAgent"),
+            "run_browser": ("app.agent.browser", "BrowserAgent"),
+        }
+        for tool_name, (module_path, class_name) in agent_map.items():
+            try:
+                import importlib
+                mod = importlib.import_module(module_path)
+                agent_class = getattr(mod, class_name)
+                self.tools[tool_name] = AgentTool(agent_class=agent_class)
+                _log.info(f"Registered agent tool: {tool_name}")
+            except Exception as e:
+                _log.warning(f"Skipping agent tool '{tool_name}': {e}")
 
         # --- Low-level: Primitive tools for direct control ---
-        self.tools["bash"] = Bash()
-        self.tools["editor"] = StrReplaceEditor()
-        self.tools["terminate"] = Terminate()
+        primitive_map = {
+            "bash": ("app.tool.bash", "Bash"),
+            "editor": ("app.tool.str_replace_editor", "StrReplaceEditor"),
+            "terminate": ("app.tool.terminate", "Terminate"),
+        }
+        for tool_name, (module_path, class_name) in primitive_map.items():
+            try:
+                import importlib
+                mod = importlib.import_module(module_path)
+                tool_class = getattr(mod, class_name)
+                self.tools[tool_name] = tool_class()
+                _log.info(f"Registered primitive tool: {tool_name}")
+            except Exception as e:
+                _log.warning(f"Skipping primitive tool '{tool_name}': {e}")
 
-        _logger.info(f"Loaded {len(self.tools)} tools: {list(self.tools.keys())}")
+        _log.info(f"Loaded {len(self.tools)} tools: {list(self.tools.keys())}")
 
     def register_tool(self, tool: Any, method_name: Optional[str] = None) -> None:
         """Register a tool with parameter validation and documentation."""
