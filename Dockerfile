@@ -32,4 +32,4 @@ RUN mkdir -p /app/OpenManus/workspace
 EXPOSE 8000
 
 # Start the MCP server in SSE (web) mode
-CMD ["uvicorn", "app.mcp.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "app.mcp.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*"]
