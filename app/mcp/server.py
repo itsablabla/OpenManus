@@ -12,11 +12,12 @@ logging.info("[ENV] LLM_API_KEY=%s", ('SET ('+str(len(os.getenv('LLM_API_KEY',''
 
 import argparse
 import asyncio
+import contextlib
 import atexit
 import json
 import os
 from inspect import Parameter, Signature
-from typing import Any, Dict, Optional
+from typing import Any, AsyncIterator, Dict, Optional
 
 import uvicorn
 from mcp.server.fastmcp import FastMCP
@@ -24,7 +25,7 @@ from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
 
 # ---------------------------------------------------------------------------
@@ -107,11 +108,7 @@ class MCPServer:
         self.tools: Dict[str, Any] = {}
 
     def _load_tools(self) -> None:
-        """Deferred import and instantiation of all tools and agents.
-
-        Uses try/except for each agent so that optional dependencies (e.g. daytona)
-        don't prevent the server from starting. Missing agents are skipped gracefully.
-        """
+        """Deferred import and instantiation of all tools and agents."""
         import logging as _logging
         _log = _logging.getLogger(__name__)
         self._logger = _log
@@ -244,21 +241,69 @@ class MCPServer:
         for tool in self.tools.values():
             self.register_tool(tool)
 
-    def _build_streamable_http_app(self) -> Starlette:
+    def build_app(self) -> Starlette:
         """
         Build a Starlette app using MCP Streamable HTTP transport (2025-03-26 spec).
 
-        Streamable HTTP uses POST /mcp for all MCP communication, which works
-        correctly through Railway's HTTP/2 edge proxy. SSE transport triggers
-        421 Misdirected Request errors from Railway's edge.
+        Key design:
+        - The FastMCP streamable_http_app() has its own lifespan that initializes
+          the StreamableHTTPSessionManager. We must run this lifespan.
+        - We compose our outer Starlette with a lifespan that:
+          1. Runs the FastMCP session manager (required for /mcp to work)
+          2. Loads our tools in the background (so /health responds immediately)
 
-        The /health route is registered FIRST so it responds immediately.
+        Transport: POST /mcp (Streamable HTTP)
+        This works through Railway's HTTP/2 edge proxy.
+        SSE (/sse) triggered 421 Misdirected Request from Railway's edge.
         """
-        # Get the Streamable HTTP Starlette app from FastMCP
-        # This exposes POST /mcp (and optional GET /mcp for SSE streaming)
+        global _server_ready
+
+        # Build the inner FastMCP Streamable HTTP app
+        # (has /mcp route + session manager lifespan)
         fastmcp_app = self.server.streamable_http_app()
 
-        # Wrap it with our health check and auth middleware
+        # The session manager is now initialized inside fastmcp_app
+        # We need to run it as part of our lifespan
+        session_manager = self.server.session_manager
+
+        @contextlib.asynccontextmanager
+        async def lifespan(app: Starlette) -> AsyncIterator[None]:
+            global _server_ready
+
+            # Start the MCP session manager (required for Streamable HTTP)
+            async with session_manager.run():
+                # Load tools in background so /health responds immediately
+                async def _load_tools_bg():
+                    global _server_ready
+                    await asyncio.sleep(0.5)
+                    logging.info("Loading tools and agents in background...")
+                    try:
+                        from app.config import config as _cfg
+                        for _name, _llm in _cfg.llm.items():
+                            logging.info(f"[CONFIG] LLM[{_name}] base_url={_llm.base_url} model={_llm.model}")
+                    except Exception as _ce:
+                        logging.warning(f"[CONFIG] Could not read LLM config: {_ce}")
+                    self.register_all_tools()
+                    _server_ready = True
+                    port = int(os.getenv("PORT", "8000"))
+                    logging.info(
+                        f"OpenManus MCP server ready\n"
+                        f"  /health  — health check\n"
+                        f"  /mcp     — MCP Streamable HTTP endpoint (auth: {'enabled' if os.getenv('MCP_SERVER_AUTH_TOKEN') else 'disabled'})\n"
+                        f"  Tools: {list(self.tools.keys())}"
+                    )
+
+                task = asyncio.create_task(_load_tools_bg())
+                try:
+                    yield
+                finally:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+
+        # Build the outer Starlette with health check + auth + MCP routes
         app = Starlette(
             debug=False,
             routes=[
@@ -268,51 +313,18 @@ class MCPServer:
             middleware=[
                 Middleware(BearerAuthMiddleware),
             ],
+            lifespan=lifespan,
         )
         return app
 
     def run(self, transport: str = "stdio") -> None:
         """Run the MCP server in the specified transport mode."""
-        global _server_ready
         atexit.register(lambda: asyncio.run(self.cleanup()))
 
         if transport == "sse":
             port = int(os.getenv("PORT", os.getenv("FASTMCP_PORT", "8000")))
-            # Always bind to 0.0.0.0 so Railway's load balancer can reach us.
             host = "0.0.0.0"
-
-            # Build the Starlette app FIRST (fast — no heavy imports yet)
-            # so uvicorn can start serving /health immediately.
-            app = self._build_streamable_http_app()
-
-            # Register tools in a background task after the server is up
-            # This ensures /health responds before the slow agent imports complete.
-            async def _startup():
-                global _server_ready
-                import asyncio as _asyncio
-                # Small delay to let uvicorn fully bind the port
-                await _asyncio.sleep(0.5)
-                logging.info("Loading tools and agents in background...")
-                # Debug: log the actual LLM config to verify env var substitution
-                try:
-                    from app.config import config as _cfg
-                    _llm_configs = _cfg.llm
-                    for _name, _llm in _llm_configs.items():
-                        logging.info(f"[CONFIG] LLM[{_name}] base_url={_llm.base_url} model={_llm.model}")
-                except Exception as _ce:
-                    logging.warning(f"[CONFIG] Could not read LLM config: {_ce}")
-                self.register_all_tools()
-                _server_ready = True
-                logging.info(
-                    f"OpenManus MCP server ready on {host}:{port}\n"
-                    f"  /health  — health check\n"
-                    f"  /mcp     — MCP Streamable HTTP endpoint (auth: {'enabled' if os.getenv('MCP_SERVER_AUTH_TOKEN') else 'disabled'})\n"
-                    f"  Tools: {list(self.tools.keys())}"
-                )
-
-            # Add startup event to Starlette app
-            app.add_event_handler("startup", _startup)
-
+            app = self.build_app()
             logging.info(f"Starting uvicorn on {host}:{port} ...")
             uvicorn.run(app, host=host, port=port, log_level="info")
         else:
