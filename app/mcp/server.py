@@ -279,6 +279,14 @@ class MCPServer:
                 # Small delay to let uvicorn fully bind the port
                 await _asyncio.sleep(0.5)
                 logging.info("Loading tools and agents in background...")
+                # Debug: log the actual LLM config to verify env var substitution
+                try:
+                    from app.config import config as _cfg
+                    _llm_configs = _cfg.llm
+                    for _name, _llm in _llm_configs.items():
+                        logging.info(f"[CONFIG] LLM[{_name}] base_url={_llm.base_url} model={_llm.model}")
+                except Exception as _ce:
+                    logging.warning(f"[CONFIG] Could not read LLM config: {_ce}")
                 self.register_all_tools()
                 _server_ready = True
                 logging.info(
