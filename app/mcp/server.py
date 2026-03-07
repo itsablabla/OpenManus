@@ -573,7 +573,7 @@ async def manus_get_task(task_id: str) -> str:
                 lines.append(f"  ... (truncated — {len(assistant_result)} chars total)")
         if error_msg:
             lines.append(f"\nError: {error_msg}")
-        if status in ("pending", "running"):
+        if status not in ("completed", "failed", "cancelled"):
             lines.append("\nTip: Task still in progress — check again in 1-2 minutes.")
 
         return "\n".join(lines)
@@ -902,13 +902,24 @@ async def garza_status(
         prose_answer = await _llm_summarize(query, digest_data)
 
         if prose_answer:
-            # LLM answer available — lead with it, append warnings
+            # LLM answer available — lead with prose, then append full structured digest
             lines = [f"GARZA OS — Manus Activity Digest (last {hours}h)"]
             lines.append(f"Query: \"{query}\"\n")
             lines.append(prose_answer)
             if warnings:
                 lines.append("")
                 lines.extend(warnings)
+            # Always append the full task details so nothing is truncated
+            lines.append("")
+            lines.append("Summary:")
+            lines.append(f"  Tasks found : {len(recent_tasks)}")
+            for s, count in sorted(statuses.items()):
+                lines.append(f"  {s:12s}: {count}")
+            if total_credits > 0:
+                lines.append(f"  Cost: {_usd(total_credits)} ({total_credits} credits)")
+            lines.append("")
+            lines.append("Task Details:")
+            lines.extend(task_summaries)
             return "\n".join(lines)
 
         # Fallback — structured output (same as before but with human timestamps + duration)
