@@ -53,7 +53,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         auth_token = os.getenv("MCP_SERVER_AUTH_TOKEN")
 
         # Only enforce auth on the MCP endpoint
-        if auth_token and request.url.path.startswith("/run"):
+        if auth_token and request.url.path.startswith("/mcp"):
             # Check X-MCP-Token first (preferred — bypasses Railway edge 421 blocking)
             provided_token = request.headers.get("X-MCP-Token", "")
             if not provided_token:
@@ -112,14 +112,29 @@ class MCPServer:
     unlike SSE which triggers 421 Misdirected Request errors.
     """
 
-    # The MCP endpoint path. Using /run instead of /mcp or /api/v1 because
-    # Railway's edge proxy blocks ALL requests to /mcp and /api/v1 paths
-    # (421 Invalid Host header). /run and similar paths pass through fine.
-    MCP_PATH = "/run"
+    # The MCP endpoint path.
+    MCP_PATH = "/mcp"
 
     def __init__(self, name: str = "openmanus"):
         port = int(os.getenv("PORT", os.getenv("FASTMCP_PORT", "8000")))
-        self.server = FastMCP(name, port=port, streamable_http_path=self.MCP_PATH)
+
+        # MCP SDK 1.24.0+ added DNS rebinding protection that checks the Host header.
+        # When deployed behind Railway's edge proxy, the Host header is the Railway
+        # domain (e.g. openmanus-mcp-production.up.railway.app) which is not in the
+        # default allowed list. We must explicitly allow it OR disable the protection.
+        # We disable it here since Railway's edge already handles security.
+        try:
+            from mcp.server.transport_security import TransportSecuritySettings
+            transport_security = TransportSecuritySettings(
+                enable_dns_rebinding_protection=False
+            )
+        except ImportError:
+            transport_security = None
+
+        kwargs = dict(port=port, streamable_http_path=self.MCP_PATH)
+        if transport_security is not None:
+            kwargs["transport_security"] = transport_security
+        self.server = FastMCP(name, **kwargs)
         self.tools: Dict[str, Any] = {}
 
     def _load_tools(self) -> None:
