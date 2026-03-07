@@ -1,8 +1,11 @@
 """
 Manus API client for the hybrid MCP server.
 
-Centralizes all interaction with open.manus.im — authentication,
+Centralizes all interaction with api.manus.ai — authentication,
 request execution, and actionable error formatting.
+
+Authentication: API_KEY header (not Bearer token)
+Base URL: https://api.manus.ai/v1
 """
 
 import os
@@ -10,7 +13,7 @@ from typing import Any, Dict, Optional
 
 import httpx
 
-MANUS_BASE_URL = "https://api.manus.im/v1"
+MANUS_BASE_URL = "https://api.manus.ai/v1"
 
 
 def _get_headers() -> Dict[str, str]:
@@ -21,7 +24,7 @@ def _get_headers() -> Dict[str, str]:
             "Add it in Railway -> Variables."
         )
     return {
-        "Authorization": f"Bearer {api_key}",
+        "API_KEY": api_key,
         "Content-Type": "application/json",
     }
 
