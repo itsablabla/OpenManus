@@ -132,7 +132,7 @@ async def terminate(reason: str = "") -> str:
 async def manus_create_task(
     prompt: str,
     task_mode: str = "agent",
-    agent_profile: str = "speed",
+    agent_profile: str = "manus-1.6",
     file_ids: str = "",
     use_gmail_connector: bool = False,
     use_notion_connector: bool = False,
@@ -147,21 +147,24 @@ async def manus_create_task(
     Args:
         prompt: Natural language task description (10-10,000 chars)
         task_mode: agent (default, full autonomous), adaptive, or chat
-        agent_profile: speed (default, ~100 credits) or quality (~200 credits, Manus 1.6 Max)
+        agent_profile: manus-1.6 (default), manus-1.6-lite (fast/cheap), or manus-1.6-max (highest quality)
         file_ids: Comma-separated file IDs from manus_upload_file (optional)
         use_gmail_connector: Grant Manus access to Gmail
         use_notion_connector: Grant Manus access to Notion
         use_gcal_connector: Grant Manus access to Google Calendar
     """
     try:
+        # Map friendly aliases to official API values
+        profile_map = {"speed": "manus-1.6", "quality": "manus-1.6-max", "lite": "manus-1.6-lite"}
+        api_profile = profile_map.get(agent_profile, agent_profile)
         body: dict = {
             "prompt": prompt,
-            "task_mode": task_mode,
-            "agent_profile": agent_profile,
+            "taskMode": task_mode,
+            "agentProfile": api_profile,
         }
 
         if file_ids:
-            body["file_ids"] = [fid.strip() for fid in file_ids.split(",") if fid.strip()]
+            body["attachments"] = [{"type": "file_id", "file_id": fid.strip()} for fid in file_ids.split(",") if fid.strip()]
 
         connectors = []
         connector_map = {
@@ -260,8 +263,10 @@ async def manus_list_tasks(
             tid = t.get("id", t.get("task_id", "?"))
             tstatus = t.get("status", "?")
             created = t.get("created_at", "")[:19]
-            prompt_preview = (t.get("prompt", "") or "")[:60]
-            lines.append(f"  {tid}  [{tstatus}]  {created}  {prompt_preview!r}")
+            meta = t.get("metadata") or {}
+            title = meta.get("task_title") or (t.get("prompt", "") or "")[:60]
+            url = meta.get("task_url", "")
+            lines.append(f"  {tid}  [{tstatus}]  {created}  {title!r}  {url}")
 
         if has_more:
             lines.append("\nMore tasks available — reduce limit or use status_filter.")
