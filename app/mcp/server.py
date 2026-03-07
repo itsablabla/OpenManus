@@ -11,6 +11,8 @@ import asyncio
 import logging
 import os
 from mcp.server.fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import JSONResponse, RedirectResponse
 from app.mcp.manus_client import handle_api_error, manus_request
 from app.mcp.manus_models import (
     CreateTaskInput,
@@ -21,6 +23,66 @@ from app.mcp.manus_models import (
 
 logger = logging.getLogger(__name__)
 mcp = FastMCP("OpenManus Hybrid MCP Server")
+
+
+# ---------------------------------------------------------------------------
+# OAuth2 well-known endpoints (required for Nango mcp-generic / MCP_OAUTH2_GENERIC)
+# Enables Nango to discover and connect to this server via the Connect flow.
+# Auth is implemented as a pass-through: the MCP_SERVER_AUTH_TOKEN is used
+# as both the authorization code and the access token.
+# ---------------------------------------------------------------------------
+
+_BASE_URL = "https://" + os.environ.get(
+    "RAILWAY_PUBLIC_DOMAIN", "openmanus-mcp-production.up.railway.app"
+)
+
+
+@mcp.custom_route("/.well-known/oauth-authorization-server", methods=["GET"])
+async def oauth_authorization_server(request: Request) -> JSONResponse:
+    """RFC 8414 — OAuth 2.0 Authorization Server Metadata (required by Nango mcp-generic)."""
+    return JSONResponse({
+        "issuer": _BASE_URL,
+        "authorization_endpoint": f"{_BASE_URL}/oauth/authorize",
+        "token_endpoint": f"{_BASE_URL}/oauth/token",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code"],
+        "code_challenge_methods_supported": ["S256"],
+        "scopes_supported": ["mcp"],
+    })
+
+
+@mcp.custom_route("/.well-known/oauth-protected-resource", methods=["GET"])
+async def oauth_protected_resource(request: Request) -> JSONResponse:
+    """RFC 9728 — OAuth 2.0 Protected Resource Metadata (required by Nango mcp-generic)."""
+    return JSONResponse({
+        "resource": _BASE_URL,
+        "authorization_servers": [_BASE_URL],
+        "bearer_methods_supported": ["header"],
+        "resource_documentation": "https://github.com/itsablabla/OpenManus",
+    })
+
+
+@mcp.custom_route("/oauth/authorize", methods=["GET"])
+async def oauth_authorize(request: Request) -> RedirectResponse:
+    """OAuth2 authorization endpoint — redirects with MCP_SERVER_AUTH_TOKEN as the code."""
+    redirect_uri = request.query_params.get("redirect_uri", "")
+    state = request.query_params.get("state", "")
+    code = os.environ.get("MCP_SERVER_AUTH_TOKEN", "")
+    return RedirectResponse(url=f"{redirect_uri}?code={code}&state={state}")
+
+
+@mcp.custom_route("/oauth/token", methods=["POST"])
+async def oauth_token(request: Request) -> JSONResponse:
+    """OAuth2 token endpoint — exchanges authorization code for access token."""
+    form = await request.form()
+    code = str(form.get("code", ""))
+    token = code or os.environ.get("MCP_SERVER_AUTH_TOKEN", "")
+    return JSONResponse({
+        "access_token": token,
+        "token_type": "Bearer",
+        "expires_in": 31536000,  # 1 year
+        "scope": "mcp",
+    })
 
 
 # ---------------------------------------------------------------------------
