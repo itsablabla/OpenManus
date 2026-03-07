@@ -53,7 +53,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         auth_token = os.getenv("MCP_SERVER_AUTH_TOKEN")
 
         # Only enforce auth on the MCP endpoint
-        if auth_token and request.url.path.startswith("/api/v1"):
+        if auth_token and request.url.path.startswith("/run"):
             # Check X-MCP-Token first (preferred — bypasses Railway edge 421 blocking)
             provided_token = request.headers.get("X-MCP-Token", "")
             if not provided_token:
@@ -112,9 +112,10 @@ class MCPServer:
     unlike SSE which triggers 421 Misdirected Request errors.
     """
 
-    # The MCP endpoint path. Using /api/v1 instead of /mcp because Railway's
-    # edge proxy blocks ALL requests to /mcp (421 Invalid Host header).
-    MCP_PATH = "/api/v1"
+    # The MCP endpoint path. Using /run instead of /mcp or /api/v1 because
+    # Railway's edge proxy blocks ALL requests to /mcp and /api/v1 paths
+    # (421 Invalid Host header). /run and similar paths pass through fine.
+    MCP_PATH = "/run"
 
     def __init__(self, name: str = "openmanus"):
         port = int(os.getenv("PORT", os.getenv("FASTMCP_PORT", "8000")))
