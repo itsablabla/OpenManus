@@ -4,15 +4,21 @@ Hybrid MCP Server for GARZA OS — OpenManus + Manus API.
 Synchronous layer  : bash, browser, editor, terminate (OpenManus local agents)
 Asynchronous layer : manus_create_task, manus_get_task, manus_list_tasks,
                      manus_upload_file, manus_list_files, manus_create_webhook,
-                     garza_status (NL task digest)
+                     garza_status (NL task digest with LLM summarization)
                      (Manus SaaS API — fire-and-forget, poll for results)
 
-Fixes applied (2026-03-07):
+Sprint 1 fixes (2026-03-07):
   Fix 5 — Auth enforcement: Bearer token validated on every SSE/tool request
   Fix 1 — Enrich list output: credit_usage, created_at, updated_at surfaced
   Fix 4 — Prompt logging: task_id + prompt logged to /tmp/task_log.jsonl
   Fix 2 — Prompt + output in manus_get_task via /messages endpoint
   Fix 3 — garza_status NL tool: conversational task digest
+
+Sprint 2 improvements (2026-03-07):
+  Imp 1 — garza_status: LLM summarization pass → prose answer shaped to query
+  Imp 2 — Human-readable timestamps across all task tools ("2h ago", "today at 11:43am")
+  Imp 3 — Task duration calculation (updated_at − created_at → "completed in 23s")
+  Imp 4 — Runaway task warning in garza_status (>30min running or >10 credits mid-run)
 """
 
 import asyncio
@@ -20,6 +26,7 @@ import json
 import logging
 import os
 import time
+from datetime import datetime, timezone
 from mcp.server.fastmcp import FastMCP
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -37,7 +44,6 @@ mcp = FastMCP("OpenManus Hybrid MCP Server")
 
 # ---------------------------------------------------------------------------
 # Fix 5 — Auth enforcement middleware
-# Validates Bearer token on all requests EXCEPT OAuth + well-known endpoints.
 # ---------------------------------------------------------------------------
 
 _PUBLIC_PATHS = {
@@ -60,7 +66,6 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 
         expected_token = os.environ.get("MCP_SERVER_AUTH_TOKEN", "")
         if not expected_token:
-            # No token configured — allow all (dev mode)
             return await call_next(request)
 
         auth_header = request.headers.get("Authorization", "")
@@ -76,15 +81,13 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-# Register middleware on the underlying Starlette app
 @mcp.custom_route("/__auth_init__", methods=["GET"])
 async def _auth_init_placeholder(request: Request) -> JSONResponse:
-    """Internal placeholder — not a real endpoint."""
     return JSONResponse({"ok": True})
 
 
 # ---------------------------------------------------------------------------
-# OAuth2 well-known endpoints (required for Nango mcp-generic / MCP_OAUTH2_GENERIC)
+# OAuth2 well-known endpoints
 # ---------------------------------------------------------------------------
 
 _BASE_URL = "https://" + os.environ.get(
@@ -94,7 +97,6 @@ _BASE_URL = "https://" + os.environ.get(
 
 @mcp.custom_route("/.well-known/oauth-authorization-server", methods=["GET"])
 async def oauth_authorization_server(request: Request) -> JSONResponse:
-    """RFC 8414 — OAuth 2.0 Authorization Server Metadata."""
     return JSONResponse({
         "issuer": _BASE_URL,
         "authorization_endpoint": f"{_BASE_URL}/oauth/authorize",
@@ -108,7 +110,6 @@ async def oauth_authorization_server(request: Request) -> JSONResponse:
 
 @mcp.custom_route("/.well-known/oauth-protected-resource", methods=["GET"])
 async def oauth_protected_resource(request: Request) -> JSONResponse:
-    """RFC 9728 — OAuth 2.0 Protected Resource Metadata."""
     return JSONResponse({
         "resource": _BASE_URL,
         "authorization_servers": [_BASE_URL],
@@ -119,7 +120,6 @@ async def oauth_protected_resource(request: Request) -> JSONResponse:
 
 @mcp.custom_route("/oauth/authorize", methods=["GET"])
 async def oauth_authorize(request: Request) -> RedirectResponse:
-    """OAuth2 authorization endpoint — redirects with MCP_SERVER_AUTH_TOKEN as the code."""
     redirect_uri = request.query_params.get("redirect_uri", "")
     state = request.query_params.get("state", "")
     code = os.environ.get("MCP_SERVER_AUTH_TOKEN", "")
@@ -128,16 +128,107 @@ async def oauth_authorize(request: Request) -> RedirectResponse:
 
 @mcp.custom_route("/oauth/token", methods=["POST"])
 async def oauth_token(request: Request) -> JSONResponse:
-    """OAuth2 token endpoint — exchanges authorization code for access token."""
     form = await request.form()
     code = str(form.get("code", ""))
     token = code or os.environ.get("MCP_SERVER_AUTH_TOKEN", "")
     return JSONResponse({
         "access_token": token,
         "token_type": "Bearer",
-        "expires_in": 31536000,  # 1 year
+        "expires_in": 31536000,
         "scope": "mcp",
     })
+
+
+# ---------------------------------------------------------------------------
+# Imp 2 — Human-readable timestamp helper
+# ---------------------------------------------------------------------------
+
+def _human_time(ts) -> str:
+    """Convert Unix epoch or ISO string to human-readable relative time.
+    
+    Examples: '2h ago', 'today at 11:43am', 'yesterday at 3:15pm', 'Mar 5 at 9:00am'
+    """
+    if not ts:
+        return ""
+    try:
+        if isinstance(ts, str):
+            # Try parsing ISO format first
+            ts_clean = ts.replace("Z", "+00:00")
+            try:
+                dt = datetime.fromisoformat(ts_clean)
+                epoch = dt.timestamp()
+            except ValueError:
+                epoch = float(ts)
+        else:
+            epoch = float(ts)
+        
+        now = time.time()
+        diff = now - epoch
+        
+        if diff < 0:
+            return "just now"
+        elif diff < 60:
+            return f"{int(diff)}s ago"
+        elif diff < 3600:
+            mins = int(diff / 60)
+            return f"{mins}m ago"
+        elif diff < 86400:
+            hrs = int(diff / 3600)
+            mins = int((diff % 3600) / 60)
+            if mins > 0:
+                return f"{hrs}h {mins}m ago"
+            return f"{hrs}h ago"
+        elif diff < 172800:
+            # Yesterday
+            dt_local = datetime.fromtimestamp(epoch)
+            return f"yesterday at {dt_local.strftime('%-I:%M%p').lower()}"
+        else:
+            dt_local = datetime.fromtimestamp(epoch)
+            return dt_local.strftime("%b %-d at %-I:%M%p").lower()
+    except (ValueError, TypeError, OSError):
+        return str(ts)
+
+
+# ---------------------------------------------------------------------------
+# Imp 3 — Task duration helper
+# ---------------------------------------------------------------------------
+
+def _task_duration(created_at, updated_at) -> str:
+    """Calculate wall-clock duration from created_at to updated_at.
+    
+    Returns: 'completed in 23s', 'ran for 4m 12s', or '' if unavailable.
+    """
+    try:
+        if not created_at or not updated_at:
+            return ""
+        
+        def to_epoch(ts):
+            if isinstance(ts, (int, float)):
+                return float(ts)
+            ts_clean = str(ts).replace("Z", "+00:00")
+            try:
+                return datetime.fromisoformat(ts_clean).timestamp()
+            except ValueError:
+                return float(ts)
+        
+        c = to_epoch(created_at)
+        u = to_epoch(updated_at)
+        diff = max(0, u - c)
+        
+        if diff < 60:
+            return f"completed in {int(diff)}s"
+        elif diff < 3600:
+            mins = int(diff / 60)
+            secs = int(diff % 60)
+            if secs > 0:
+                return f"ran for {mins}m {secs}s"
+            return f"ran for {mins}m"
+        else:
+            hrs = int(diff / 3600)
+            mins = int((diff % 3600) / 60)
+            return f"ran for {hrs}h {mins}m"
+    except (ValueError, TypeError):
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +236,6 @@ async def oauth_token(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 def _log_task(task_id: str, prompt: str) -> None:
-    """Append task creation record to /tmp/task_log.jsonl (Fix 4)."""
     try:
         record = json.dumps({
             "task_id": task_id,
@@ -159,7 +249,6 @@ def _log_task(task_id: str, prompt: str) -> None:
 
 
 def _read_task_log(hours: int = 24) -> list:
-    """Read recent task log entries within the last N hours."""
     cutoff = int(time.time()) - (hours * 3600)
     entries = []
     try:
@@ -177,7 +266,86 @@ def _read_task_log(hours: int = 24) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Synchronous tools (existing OpenManus agents — unchanged from upstream)
+# Imp 1 — LLM summarization helper for garza_status
+# ---------------------------------------------------------------------------
+
+async def _llm_summarize(query: str, digest_data: dict) -> str:
+    """Call OpenAI/Gemini to generate a prose answer shaped to the query.
+    
+    Falls back gracefully to structured output if LLM is unavailable.
+    """
+    api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        return ""  # Fall back to structured output
+    
+    try:
+        import httpx
+        
+        tasks = digest_data.get("tasks", [])
+        total = len(tasks)
+        completed = sum(1 for t in tasks if t.get("status") == "completed")
+        failed = sum(1 for t in tasks if t.get("status") == "failed")
+        running = sum(1 for t in tasks if t.get("status") in ("running", "pending"))
+        total_credits = digest_data.get("total_credits", 0)
+        hours = digest_data.get("hours", 24)
+        warnings = digest_data.get("warnings", [])
+        
+        task_lines = []
+        for t in tasks[:8]:  # Limit context
+            tid = t.get("id", "?")
+            status = t.get("status", "?")
+            prompt = t.get("prompt_preview", "(no prompt)")
+            duration = t.get("duration", "")
+            credits = t.get("credits", 0)
+            line = f"- [{status.upper()}] {prompt[:120]}"
+            if duration:
+                line += f" ({duration})"
+            if credits:
+                line += f" — {credits} credits"
+            task_lines.append(line)
+        
+        context = f"""Recent Manus AI activity (last {hours}h):
+- Total tasks: {total}
+- Completed: {completed}, Failed: {failed}, Running: {running}
+- Credits used: {total_credits}
+{chr(10).join(task_lines)}
+{chr(10).join(warnings) if warnings else ''}"""
+        
+        system_prompt = """You are GARZA OS, Jaden Garza's AI estate manager. 
+Answer questions about recent Manus AI activity in 2-4 natural sentences.
+Be direct and conversational. Lead with the answer to the question asked.
+Use specific numbers. Flag warnings prominently with ⚠️.
+Never use bullet points. Write as if speaking to Jaden directly."""
+        
+        # Try OpenAI-compatible endpoint first (pre-configured in sandbox)
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY', '')}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "gpt-4.1-mini",
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": f"Query: {query}\n\nContext:\n{context}"},
+                    ],
+                    "max_tokens": 300,
+                    "temperature": 0.3,
+                },
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return data["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        logger.warning("[garza_status] LLM summarization failed: %s", e)
+    
+    return ""  # Fall back to structured output
+
+
+# ---------------------------------------------------------------------------
+# Synchronous tools
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
@@ -279,16 +447,20 @@ async def manus_create_task(
             body["connectors"] = connectors
 
         result = await manus_request("POST", "/tasks", json=body)
-        task_id = result.get("id", result.get("task_id", "unknown"))
+        task_id = result.get("id") or result.get("task_id", "unknown")
         status = result.get("status", "pending")
+        created_at = result.get("created_at", "")
 
         # Fix 4 — Log prompt for NL query support
         _log_task(task_id, prompt)
+
+        created_human = _human_time(created_at) if created_at else "just now"
 
         return (
             f"Task created successfully.\n"
             f"task_id : {task_id}\n"
             f"status  : {status}\n"
+            f"created : {created_human}\n"
             f"prompt  : {prompt[:120]}{'...' if len(prompt) > 120 else ''}\n"
             f"Tip     : Call manus_get_task(task_id='{task_id}') in 2-3 minutes to check progress."
         )
@@ -300,7 +472,7 @@ async def manus_create_task(
 async def manus_get_task(task_id: str) -> str:
     """
     Poll the status and output of a Manus task.
-    Returns the original prompt, current status, and Manus's result text.
+    Returns the original prompt, current status, duration, and Manus's result text.
 
     Args:
         task_id: The task ID returned by manus_create_task
@@ -333,20 +505,26 @@ async def manus_get_task(task_id: str) -> str:
                 if role == "user" and not user_prompt and text:
                     user_prompt = text[:500]
                 elif role == "assistant" and text:
-                    assistant_result = text  # keep last assistant message
-                # Check for usage info
+                    assistant_result = text
                 usage = item.get("usage") or {}
                 if usage.get("total_tokens"):
                     credit_usage = usage.get("total_tokens")
         elif isinstance(output_items, str):
             assistant_result = output_items
 
-        # Fall back to task log for prompt if not in API response
+        # Fall back to task log for prompt
         if not user_prompt:
-            for entry in _read_task_log(hours=168):  # 7 days
+            for entry in _read_task_log(hours=168):
                 if entry.get("task_id") == task_id:
                     user_prompt = entry.get("prompt", "")[:500]
                     break
+
+        # Imp 2 — Human-readable timestamps
+        created_human = _human_time(created_at) if created_at else ""
+        updated_human = _human_time(updated_at) if updated_at else ""
+
+        # Imp 3 — Duration calculation
+        duration = _task_duration(created_at, updated_at)
 
         lines = [
             f"task_id     : {task_id}",
@@ -356,10 +534,12 @@ async def manus_get_task(task_id: str) -> str:
             lines.append(f"title       : {task_title}")
         if task_url:
             lines.append(f"url         : {task_url}")
-        if created_at:
-            lines.append(f"created_at  : {created_at}")
-        if updated_at:
-            lines.append(f"updated_at  : {updated_at}")
+        if created_human:
+            lines.append(f"created     : {created_human}")
+        if updated_human and updated_human != created_human:
+            lines.append(f"updated     : {updated_human}")
+        if duration:
+            lines.append(f"duration    : {duration}")
         if credit_usage is not None:
             lines.append(f"tokens_used : {credit_usage}")
         if user_prompt:
@@ -402,31 +582,33 @@ async def manus_list_tasks(
         if not tasks:
             return "No tasks found."
 
-        # Fix 1 — Load local prompt log for enrichment
         log_by_id = {e["task_id"]: e["prompt"] for e in _read_task_log(hours=168)}
 
         lines = [f"Tasks ({len(tasks)} returned):"]
         for t in tasks:
             tid = t.get("id", t.get("task_id", "?"))
             tstatus = t.get("status", "?")
-            # Fix 1 — Surface timestamps and credit usage
-            created = t.get("created_at", "")
-            updated = t.get("updated_at", "")
+            created_at = t.get("created_at", "")
+            updated_at = t.get("updated_at", "")
             credit_usage = t.get("credit_usage") or t.get("credits_used")
             meta = t.get("metadata") or {}
             title = meta.get("task_title") or (t.get("prompt", "") or "")[:60]
             url = meta.get("task_url", "")
 
-            # Enrich with local prompt log
+            # Imp 2 — Human-readable timestamps
+            created_human = _human_time(created_at) if created_at else ""
+            # Imp 3 — Duration
+            duration = _task_duration(created_at, updated_at)
+
             prompt_preview = log_by_id.get(tid, "")[:80]
 
             line = f"  {tid}  [{tstatus}]"
-            if created:
-                line += f"  created:{created}"
-            if updated and updated != created:
-                line += f"  updated:{updated}"
+            if created_human:
+                line += f"  {created_human}"
+            if duration:
+                line += f"  ({duration})"
             if credit_usage is not None:
-                line += f"  credits:{credit_usage}"
+                line += f"  {credit_usage} credits"
             line += f"  {title!r}"
             if prompt_preview and prompt_preview not in title:
                 line += f"  prompt:'{prompt_preview}'"
@@ -505,8 +687,9 @@ async def manus_list_files(limit: int = 20) -> str:
             fid = f.get("id", "?")
             name = f.get("filename") or f.get("name", "?")
             size = f.get("size", "?")
-            created = (f.get("created_at") or "")[:19]
-            lines.append(f"  {fid}  {name}  {size} bytes  {created}")
+            created_at = f.get("created_at", "")
+            created_human = _human_time(created_at) if created_at else ""
+            lines.append(f"  {fid}  {name}  {size} bytes  {created_human}")
 
         return "\n".join(lines)
     except Exception as e:
@@ -520,9 +703,6 @@ async def manus_create_webhook(
 ) -> str:
     """
     Register a webhook to receive Manus task completion events.
-
-    Use your n8n webhook trigger URL so GARZA OS is notified automatically
-    when long-running tasks finish — no polling required.
 
     Args:
         url: Webhook endpoint URL (e.g., your n8n webhook trigger URL)
@@ -553,8 +733,12 @@ async def manus_create_webhook(
 
 
 # ---------------------------------------------------------------------------
-# Fix 3 — garza_status: Natural Language task digest tool
+# garza_status — Sprint 2: LLM summarization + runaway task warning
 # ---------------------------------------------------------------------------
+
+_RUNAWAY_MINUTES = int(os.environ.get("GARZA_RUNAWAY_MINUTES", "30"))
+_RUNAWAY_CREDITS = int(os.environ.get("GARZA_RUNAWAY_CREDITS", "10"))
+
 
 @mcp.tool()
 async def garza_status(
@@ -564,6 +748,7 @@ async def garza_status(
 ) -> str:
     """
     Answer natural language questions about recent Manus activity.
+    Returns a prose answer shaped to the question asked, powered by LLM summarization.
 
     Examples:
       - "What did Manus accomplish today?"
@@ -578,14 +763,11 @@ async def garza_status(
         limit: Max tasks to include in the digest (default 10)
     """
     try:
-        # Fetch recent tasks from API
         result = await manus_request("GET", "/tasks", params={"limit": limit})
         tasks = result.get("tasks", result.get("data", []))
 
-        # Load local prompt log for enrichment
         log_by_id = {e["task_id"]: e for e in _read_task_log(hours=hours)}
 
-        # Filter to the requested time window
         cutoff = int(time.time()) - (hours * 3600)
         recent_tasks = []
         for t in tasks:
@@ -600,10 +782,13 @@ async def garza_status(
         if not recent_tasks:
             return f"No Manus tasks found in the last {hours} hours."
 
-        # Build digest
         total_credits = 0
         statuses = {}
         task_summaries = []
+        warnings = []
+        enriched_tasks = []
+
+        now = time.time()
 
         for t in recent_tasks:
             tid = t.get("id", "?")
@@ -611,20 +796,42 @@ async def garza_status(
             statuses[tstatus] = statuses.get(tstatus, 0) + 1
             credits = t.get("credit_usage") or t.get("credits_used") or 0
             try:
-                total_credits += int(credits)
+                credits_int = int(credits)
+                total_credits += credits_int
             except (TypeError, ValueError):
-                pass
+                credits_int = 0
 
             meta = t.get("metadata") or {}
             title = meta.get("task_title", "")
             url = meta.get("task_url", "")
-            created = t.get("created_at", "")
+            created_at = t.get("created_at", "")
+            updated_at = t.get("updated_at", "")
 
-            # Get prompt from log
+            # Imp 2 — Human-readable timestamps
+            created_human = _human_time(created_at) if created_at else ""
+            # Imp 3 — Duration
+            duration = _task_duration(created_at, updated_at)
+
+            # Imp 4 — Runaway task detection
+            if tstatus in ("running", "pending") and created_at:
+                try:
+                    elapsed_mins = (now - float(created_at)) / 60
+                    if elapsed_mins > _RUNAWAY_MINUTES:
+                        warnings.append(
+                            f"⚠️  RUNAWAY TASK: {tid} has been running for "
+                            f"{int(elapsed_mins)}m (>{_RUNAWAY_MINUTES}m threshold)"
+                        )
+                    elif credits_int > _RUNAWAY_CREDITS:
+                        warnings.append(
+                            f"⚠️  HIGH CREDIT USAGE: {tid} consumed {credits_int} credits "
+                            f"while still running (>{_RUNAWAY_CREDITS} threshold)"
+                        )
+                except (ValueError, TypeError):
+                    pass
+
             log_entry = log_by_id.get(tid, {})
             prompt = log_entry.get("prompt", title or "(no prompt recorded)")[:200]
 
-            # Get result summary from output
             output_items = t.get("output") or []
             result_preview = ""
             if isinstance(output_items, list):
@@ -637,9 +844,24 @@ async def garza_status(
                     if result_preview:
                         break
 
+            enriched_tasks.append({
+                "id": tid,
+                "status": tstatus,
+                "prompt_preview": prompt,
+                "duration": duration,
+                "credits": credits_int,
+                "created_human": created_human,
+                "url": url,
+                "result_preview": result_preview,
+            })
+
             summary = f"  [{tstatus.upper()}] {tid}"
-            if created:
-                summary += f"  (created: {created})"
+            if created_human:
+                summary += f"  ({created_human})"
+            if duration:
+                summary += f"  {duration}"
+            if credits_int:
+                summary += f"  {credits_int} credits"
             summary += f"\n    Asked: {prompt}"
             if result_preview:
                 summary += f"\n    Result: {result_preview}"
@@ -647,7 +869,26 @@ async def garza_status(
                 summary += f"\n    Link: {url}"
             task_summaries.append(summary)
 
-        # Build the response
+        # Imp 1 — Try LLM summarization first
+        digest_data = {
+            "tasks": enriched_tasks,
+            "total_credits": total_credits,
+            "hours": hours,
+            "warnings": warnings,
+        }
+        prose_answer = await _llm_summarize(query, digest_data)
+
+        if prose_answer:
+            # LLM answer available — lead with it, append warnings
+            lines = [f"GARZA OS — Manus Activity Digest (last {hours}h)"]
+            lines.append(f"Query: \"{query}\"\n")
+            lines.append(prose_answer)
+            if warnings:
+                lines.append("")
+                lines.extend(warnings)
+            return "\n".join(lines)
+
+        # Fallback — structured output (same as before but with human timestamps + duration)
         lines = [
             f"GARZA OS — Manus Activity Digest (last {hours}h)",
             f"Query: \"{query}\"",
@@ -659,6 +900,11 @@ async def garza_status(
             lines.append(f"  {s:12s}: {count}")
         if total_credits > 0:
             lines.append(f"  Credits used: {total_credits}")
+
+        if warnings:
+            lines.append("")
+            lines.extend(warnings)
+
         lines.append("")
         lines.append("Task Details:")
         lines.extend(task_summaries)
