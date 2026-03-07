@@ -1,32 +1,36 @@
 # coding: utf-8
 """
 Entry point for the OpenManus Hybrid MCP Server.
-Launches the FastMCP server using SSE transport via uvicorn directly,
-with proxy headers support for Railway's reverse proxy.
-
-Uses h11 (HTTP/1.1 only) because SSE requires persistent HTTP/1.1 connections.
-HTTP/2 multiplexing is incompatible with SSE streaming.
+Launches the FastMCP server using SSE transport.
+Disables DNS rebinding protection so Railway's proxy Host header is accepted.
 """
 import os
+import logging
 
-if __name__ == "__main__":
-    import uvicorn
-    from app.mcp.server import mcp
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-    port = int(os.environ.get("PORT", os.environ.get("FASTMCP_PORT", "8080")))
-    host = "0.0.0.0"
+PORT = int(os.environ.get("PORT", os.environ.get("FASTMCP_PORT", "8080")))
+HOST = "0.0.0.0"
 
-    print(f"[run_mcp_server] Starting SSE on {host}:{port} (HTTP/1.1 h11)", flush=True)
+logger.info(f"[run_mcp_server] Starting SSE on {HOST}:{PORT}")
 
-    # Get the Starlette app from FastMCP (includes custom_route endpoints)
-    starlette_app = mcp.sse_app()
+from app.mcp.server import mcp
 
-    uvicorn.run(
-        starlette_app,
-        host=host,
-        port=port,
-        proxy_headers=True,          # Trust X-Forwarded-* headers from Railway
-        forwarded_allow_ips="*",     # Allow all IPs to set forwarded headers
-        http="h11",                  # Force HTTP/1.1 — SSE requires persistent connections
-        log_level="info",
+# Override host/port settings
+mcp.settings.host = HOST
+mcp.settings.port = PORT
+
+# Disable DNS rebinding protection — Railway's edge proxy handles security.
+# Without this, the mcp TransportSecurityMiddleware returns 421 for Railway's Host header.
+try:
+    from mcp.server.transport_security import TransportSecuritySettings
+    mcp.settings.transport_security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=False
     )
+    logger.info("DNS rebinding protection disabled (Railway edge handles security)")
+except (ImportError, AttributeError):
+    logger.info("TransportSecuritySettings not available — skipping")
+
+logger.info(f"Starting MCP SSE server on {HOST}:{PORT}")
+mcp.run(transport="sse")
