@@ -1,8 +1,14 @@
 import logging
 import sys
+import os
 
 # Configure logging FIRST before any other imports that might trigger config loading
 logging.basicConfig(level=logging.INFO, handlers=[logging.StreamHandler(sys.stderr)])
+
+# Dump LLM env vars immediately to diagnose Railway env var injection
+logging.info("[ENV] LLM_BASE_URL=%s", os.getenv('LLM_BASE_URL', '<NOT SET>'))
+logging.info("[ENV] LLM_MODEL=%s", os.getenv('LLM_MODEL', '<NOT SET>'))
+logging.info("[ENV] LLM_API_KEY=%s", ('SET ('+str(len(os.getenv('LLM_API_KEY','')))+'chars)') if os.getenv('LLM_API_KEY') else '<NOT SET>')
 
 import argparse
 import asyncio
