@@ -222,7 +222,9 @@ class MCPServer:
 
         if transport == "sse":
             port = int(os.getenv("PORT", os.getenv("FASTMCP_PORT", "8000")))
-            host = self.server.settings.host
+            # Always bind to 0.0.0.0 in SSE mode so Railway's load balancer can reach us.
+            # FastMCP defaults to 127.0.0.1 which is unreachable from outside the container.
+            host = "0.0.0.0"
             logger.info(f"SSE server listening on {host}:{port}")
             logger.info(f"  /health  — health check")
             logger.info(f"  /sse     — MCP endpoint (auth: {'enabled' if os.getenv('MCP_SERVER_AUTH_TOKEN') else 'disabled'})")
