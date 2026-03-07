@@ -53,7 +53,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         auth_token = os.getenv("MCP_SERVER_AUTH_TOKEN")
 
         # Only enforce auth on the MCP endpoint
-        if auth_token and request.url.path.startswith("/mcp"):
+        if auth_token and request.url.path.startswith("/api/v1"):
             # Check X-MCP-Token first (preferred — bypasses Railway edge 421 blocking)
             provided_token = request.headers.get("X-MCP-Token", "")
             if not provided_token:
@@ -112,9 +112,13 @@ class MCPServer:
     unlike SSE which triggers 421 Misdirected Request errors.
     """
 
+    # The MCP endpoint path. Using /api/v1 instead of /mcp because Railway's
+    # edge proxy blocks ALL requests to /mcp (421 Invalid Host header).
+    MCP_PATH = "/api/v1"
+
     def __init__(self, name: str = "openmanus"):
         port = int(os.getenv("PORT", os.getenv("FASTMCP_PORT", "8000")))
-        self.server = FastMCP(name, port=port)
+        self.server = FastMCP(name, port=port, streamable_http_path=self.MCP_PATH)
         self.tools: Dict[str, Any] = {}
 
     def _load_tools(self) -> None:
@@ -298,8 +302,8 @@ class MCPServer:
                     port = int(os.getenv("PORT", "8000"))
                     logging.info(
                         f"OpenManus MCP server ready\n"
-                        f"  /health  — health check\n"
-                        f"  /mcp     — MCP Streamable HTTP endpoint (auth: {'enabled' if os.getenv('MCP_SERVER_AUTH_TOKEN') else 'disabled'})\n"
+                        f"  /health      — health check\n"
+                        f"  {self.MCP_PATH}  — MCP Streamable HTTP endpoint (auth: {'enabled' if os.getenv('MCP_SERVER_AUTH_TOKEN') else 'disabled'})\n"
                         f"  Tools: {list(self.tools.keys())}"
                     )
 
