@@ -31,5 +31,8 @@ RUN mkdir -p /app/OpenManus/workspace
 # Expose default port (Railway overrides via $PORT env var at runtime)
 EXPOSE 8000
 
-# Start the MCP server in SSE (web) mode
-CMD ["uvicorn", "app.mcp.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*"]
+# Start the MCP server using Streamable HTTP transport (MCP 2025-03-26 spec).
+# This uses POST /mcp instead of GET /sse, which works correctly through
+# Railway's HTTP/2 edge proxy (SSE triggered 421 Misdirected Request errors).
+# Railway injects $PORT at runtime; we read it via the PORT env var.
+CMD ["sh", "-c", "uvicorn app.mcp.main:app --host 0.0.0.0 --port ${PORT:-8000}"]

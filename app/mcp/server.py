@@ -24,7 +24,7 @@ from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Mount, Route
 
 # ---------------------------------------------------------------------------
@@ -41,15 +41,15 @@ from starlette.routing import Mount, Route
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     """
-    Validates Bearer token on the /sse endpoint.
+    Validates Bearer token on the /mcp endpoint.
     If MCP_SERVER_AUTH_TOKEN is not set, auth is disabled (dev mode).
     """
 
     async def dispatch(self, request: Request, call_next):
         auth_token = os.getenv("MCP_SERVER_AUTH_TOKEN")
 
-        # Only enforce auth if the token is configured
-        if auth_token and request.url.path == "/sse":
+        # Only enforce auth on the MCP endpoint
+        if auth_token and request.url.path.startswith("/mcp"):
             auth_header = request.headers.get("Authorization", "")
             if not auth_header:
                 return JSONResponse(
@@ -95,6 +95,10 @@ class MCPServer:
 
     Agent and tool imports are deferred until register_all_tools() is called
     so that the HTTP server (and /health endpoint) can start immediately.
+
+    Transport: Streamable HTTP (MCP 2025-03-26 spec) via POST /mcp
+    This transport works correctly through Railway's HTTP/2 edge proxy,
+    unlike SSE which triggers 421 Misdirected Request errors.
     """
 
     def __init__(self, name: str = "openmanus"):
@@ -240,14 +244,19 @@ class MCPServer:
         for tool in self.tools.values():
             self.register_tool(tool)
 
-    def _build_sse_app(self) -> Starlette:
+    def _build_streamable_http_app(self) -> Starlette:
         """
-        Build a Starlette app wrapping FastMCP's SSE transport,
-        adding the health check route and Bearer auth middleware.
+        Build a Starlette app using MCP Streamable HTTP transport (2025-03-26 spec).
+
+        Streamable HTTP uses POST /mcp for all MCP communication, which works
+        correctly through Railway's HTTP/2 edge proxy. SSE transport triggers
+        421 Misdirected Request errors from Railway's edge.
+
         The /health route is registered FIRST so it responds immediately.
         """
-        # Get the raw Starlette app from FastMCP (has /sse and /messages/ routes)
-        fastmcp_app = self.server.sse_app()
+        # Get the Streamable HTTP Starlette app from FastMCP
+        # This exposes POST /mcp (and optional GET /mcp for SSE streaming)
+        fastmcp_app = self.server.streamable_http_app()
 
         # Wrap it with our health check and auth middleware
         app = Starlette(
@@ -269,13 +278,12 @@ class MCPServer:
 
         if transport == "sse":
             port = int(os.getenv("PORT", os.getenv("FASTMCP_PORT", "8000")))
-            # Always bind to 0.0.0.0 in SSE mode so Railway's load balancer can reach us.
-            # FastMCP defaults to 127.0.0.1 which is unreachable from outside the container.
+            # Always bind to 0.0.0.0 so Railway's load balancer can reach us.
             host = "0.0.0.0"
 
             # Build the Starlette app FIRST (fast — no heavy imports yet)
             # so uvicorn can start serving /health immediately.
-            app = self._build_sse_app()
+            app = self._build_streamable_http_app()
 
             # Register tools in a background task after the server is up
             # This ensures /health responds before the slow agent imports complete.
@@ -298,7 +306,7 @@ class MCPServer:
                 logging.info(
                     f"OpenManus MCP server ready on {host}:{port}\n"
                     f"  /health  — health check\n"
-                    f"  /sse     — MCP endpoint (auth: {'enabled' if os.getenv('MCP_SERVER_AUTH_TOKEN') else 'disabled'})\n"
+                    f"  /mcp     — MCP Streamable HTTP endpoint (auth: {'enabled' if os.getenv('MCP_SERVER_AUTH_TOKEN') else 'disabled'})\n"
                     f"  Tools: {list(self.tools.keys())}"
                 )
 
