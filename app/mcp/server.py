@@ -172,31 +172,28 @@ async def manus_get_task(task_id: str) -> str:
 @mcp.tool()
 async def manus_list_tasks(
     limit: int = 20,
-    offset: int = 0,
     status_filter: str = "",
 ) -> str:
     """
-    List recent Manus tasks with pagination.
+    List recent Manus tasks.
 
     Args:
         limit: Number of tasks to return (1-100, default 20)
-        offset: Pagination offset (default 0)
         status_filter: Optional filter — pending | running | completed | failed
     """
     try:
-        params: dict = {"limit": limit, "offset": offset}
+        params: dict = {"limit": limit}
         if status_filter:
             params["status"] = status_filter
 
         result = await manus_request("GET", "/tasks", params=params)
         tasks = result.get("tasks", result.get("data", []))
         has_more = result.get("has_more", False)
-        next_offset = result.get("next_offset", offset + len(tasks))
 
         if not tasks:
             return "No tasks found."
 
-        lines = [f"Tasks ({len(tasks)} returned, offset={offset}):"]
+        lines = [f"Tasks ({len(tasks)} returned):"]
         for t in tasks:
             tid = t.get("id", t.get("task_id", "?"))
             tstatus = t.get("status", "?")
@@ -205,7 +202,7 @@ async def manus_list_tasks(
             lines.append(f"  {tid}  [{tstatus}]  {created}  {prompt_preview!r}")
 
         if has_more:
-            lines.append(f"\nMore tasks available — call with offset={next_offset}")
+            lines.append("\nMore tasks available — reduce limit or use status_filter.")
 
         return "\n".join(lines)
     except Exception as e:
@@ -258,16 +255,15 @@ async def manus_upload_file(filename: str, content_base64: str, content_type: st
 
 
 @mcp.tool()
-async def manus_list_files(limit: int = 20, offset: int = 0) -> str:
+async def manus_list_files(limit: int = 20) -> str:
     """
     List files uploaded to Manus.
 
     Args:
         limit: Number of files to return (default 20)
-        offset: Pagination offset (default 0)
     """
     try:
-        result = await manus_request("GET", "/files", params={"limit": limit, "offset": offset})
+        result = await manus_request("GET", "/files", params={"limit": limit})
         files = result.get("files", result.get("data", []))
 
         if not files:
