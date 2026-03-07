@@ -270,11 +270,11 @@ def _read_task_log(hours: int = 24) -> list:
 # ---------------------------------------------------------------------------
 
 async def _llm_summarize(query: str, digest_data: dict) -> str:
-    """Call OpenAI/Gemini to generate a prose answer shaped to the query.
+    """Call Gemini 2.5 Flash to generate a prose answer shaped to the query.
     
     Falls back gracefully to structured output if LLM is unavailable.
     """
-    api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("GEMINI_API_KEY")
+    api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         return ""  # Fall back to structured output
     
@@ -287,9 +287,7 @@ async def _llm_summarize(query: str, digest_data: dict) -> str:
         failed = sum(1 for t in tasks if t.get("status") == "failed")
         running = sum(1 for t in tasks if t.get("status") in ("running", "pending"))
         total_credits = digest_data.get("total_credits", 0)
-        hours = digest_data.get("hours", 24)
-        warnings = digest_data.get("warnings", [])
-        
+        hours = digest_data.get("hours", 24)     
         task_lines = []
         for t in tasks[:8]:  # Limit context
             tid = t.get("id", "?")
@@ -304,6 +302,8 @@ async def _llm_summarize(query: str, digest_data: dict) -> str:
                 line += f" — {credits} credits"
             task_lines.append(line)
         
+        warnings = digest_data.get("warnings", [])
+
         context = f"""Recent Manus AI activity (last {hours}h):
 - Total tasks: {total}
 - Completed: {completed}, Failed: {failed}, Running: {running}
@@ -317,29 +317,30 @@ Be direct and conversational. Lead with the answer to the question asked.
 Use specific numbers. Flag warnings prominently with ⚠️.
 Never use bullet points. Write as if speaking to Jaden directly."""
         
-        # Try OpenAI-compatible endpoint first (pre-configured in sandbox)
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        full_prompt = f"{system_prompt}\n\nQuery: {query}\n\nContext:\n{context}"
+
+        # Call Gemini 2.5 Flash via REST API
+        async with httpx.AsyncClient(timeout=20.0) as client:
             resp = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY', '')}",
-                    "Content-Type": "application/json",
-                },
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}",
+                headers={"Content-Type": "application/json"},
                 json={
-                    "model": "gpt-4.1-mini",
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": f"Query: {query}\n\nContext:\n{context}"},
-                    ],
-                    "max_tokens": 300,
-                    "temperature": 0.3,
+                    "contents": [{"parts": [{"text": full_prompt}]}],
+                    "generationConfig": {
+                        "maxOutputTokens": 300,
+                        "temperature": 0.3,
+                    },
                 },
             )
             if resp.status_code == 200:
                 data = resp.json()
-                return data["choices"][0]["message"]["content"].strip()
+                candidates = data.get("candidates", [])
+                if candidates:
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    if parts:
+                        return parts[0].get("text", "").strip()
     except Exception as e:
-        logger.warning("[garza_status] LLM summarization failed: %s", e)
+        logger.warning("[garza_status] Gemini summarization failed: %s", e)
     
     return ""  # Fall back to structured output
 
