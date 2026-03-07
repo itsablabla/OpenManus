@@ -155,7 +155,7 @@ async def manus_create_task(
     """
     try:
         # Map friendly aliases to official API values
-        profile_map = {"speed": "manus-1.6", "quality": "manus-1.6-max", "lite": "manus-1.6-lite"}
+        profile_map = {"speed": "manus-1.6", "quality": "manus-1.6-max", "lite": "manus-1.6-lite", "general": "manus-1.6", "default": "manus-1.6"}
         api_profile = profile_map.get(agent_profile, agent_profile)
         body: dict = {
             "prompt": prompt,
@@ -367,8 +367,10 @@ async def manus_create_webhook(
     try:
         event_list = [e.strip() for e in events.split(",") if e.strip()]
         result = await manus_request("POST", "/webhooks", json={
-            "url": url,
-            "events": event_list,
+            "webhook": {
+                "url": url,
+                "events": event_list,
+            }
         })
         webhook_id = result.get("id") or result.get("webhook_id", "unknown")
         secret = result.get("secret", "(none)")
