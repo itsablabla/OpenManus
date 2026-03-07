@@ -237,7 +237,34 @@ class Config:
             env_value = os.getenv(placeholder)
             if env_value is not None:
                 content = content.replace(f"${{{placeholder}}}", env_value)
-        return tomllib.loads(content)
+        raw = tomllib.loads(content)
+
+        # --- Direct env var override (Railway / Docker safety net) ---
+        # If substitution failed (env vars not injected at build time), apply
+        # them now from the runtime environment.  This covers the case where
+        # Railway injects env vars at container start but AFTER the TOML was
+        # already baked into the image.
+        llm_section = raw.get("llm", {})
+        env_overrides = {
+            "model":    os.getenv("LLM_MODEL"),
+            "base_url": os.getenv("LLM_BASE_URL"),
+            "api_key":  os.getenv("LLM_API_KEY"),
+        }
+        for key, val in env_overrides.items():
+            if val is not None:
+                # Apply to top-level [llm] section
+                llm_section[key] = val
+                # Apply to every sub-table (e.g. [llm.vision])
+                for sub_key, sub_val in llm_section.items():
+                    if isinstance(sub_val, dict):
+                        sub_val[key] = val
+        raw["llm"] = llm_section
+
+        import logging as _logging
+        _logging.info("[CONFIG] LLM[default] base_url=%s model=%s",
+                      llm_section.get("base_url", "<unset>"),
+                      llm_section.get("model", "<unset>"))
+        return raw
 
     def _load_initial_config(self):
         raw_config = self._load_config()
