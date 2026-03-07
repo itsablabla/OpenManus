@@ -42,7 +42,10 @@ from starlette.routing import Mount, Route
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     """
-    Validates Bearer token on the /mcp endpoint.
+    Validates auth token on the /mcp endpoint.
+    Accepts token via:
+      - X-MCP-Token: <token>  (preferred — Railway edge doesn't block custom headers)
+      - Authorization: Bearer <token>  (standard, but Railway may block long hex tokens)
     If MCP_SERVER_AUTH_TOKEN is not set, auth is disabled (dev mode).
     """
 
@@ -51,13 +54,20 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 
         # Only enforce auth on the MCP endpoint
         if auth_token and request.url.path.startswith("/mcp"):
-            auth_header = request.headers.get("Authorization", "")
-            if not auth_header:
+            # Check X-MCP-Token first (preferred — bypasses Railway edge 421 blocking)
+            provided_token = request.headers.get("X-MCP-Token", "")
+            if not provided_token:
+                # Fall back to Authorization: Bearer <token>
+                auth_header = request.headers.get("Authorization", "")
+                parts = auth_header.split()
+                if len(parts) == 2 and parts[0].lower() == "bearer":
+                    provided_token = parts[1]
+
+            if not provided_token:
                 return JSONResponse(
-                    {"error": "Missing Authorization header"}, status_code=401
+                    {"error": "Missing auth token. Use X-MCP-Token header or Authorization: Bearer"}, status_code=401
                 )
-            parts = auth_header.split()
-            if len(parts) != 2 or parts[0].lower() != "bearer" or parts[1] != auth_token:
+            if provided_token != auth_token:
                 return JSONResponse(
                     {"error": "Invalid authentication credentials"}, status_code=401
                 )
