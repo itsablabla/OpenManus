@@ -37,6 +37,19 @@ except (ImportError, AttributeError):
 app = mcp.sse_app()
 app.add_middleware(BearerAuthMiddleware)
 
+# Add /health endpoint for Railway healthcheck (must bypass auth middleware)
+# Insert as a raw Starlette route so it's checked before the middleware chain
+from starlette.routing import Route
+from starlette.responses import JSONResponse as _JSONResponse
+
+
+async def _health_handler(request):
+    return _JSONResponse({"status": "ok", "service": "OpenManus MCP"})
+
+
+app.routes.insert(0, Route("/health", _health_handler, methods=["GET"]))
+logger.info("Registered /health endpoint for Railway healthcheck")
+
 logger.info(f"Starting MCP SSE server on {HOST}:{PORT} with Bearer auth enforcement")
 
 import uvicorn
