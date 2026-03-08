@@ -2677,6 +2677,11 @@ BLOCKER_PATTERNS = {
     "rate_limit":       [r"rate limit", r"too many requests", r"429", r"quota"],
     "confusion":        [r"i'm not sure", r"unclear", r"could you clarify", r"what do you mean"],
     "timeout":          [r"timed out", r"took too long", r"exceeded.*time"],
+    "network_error":    [r"connection refused", r"connection reset", r"name.*not resolve",
+                         r"network.*unreachable", r"ssl.*error", r"certificate", r"econnrefused"],
+    "file_not_found":   [r"no such file", r"file not found", r"path.*not exist", r"enoent",
+                         r"cannot open", r"failed to read"],
+    "tool_error":       [r"tool.*failed", r"mcp.*error", r"server.*error", r"500", r"internal error"],
     "completed_clean":  [],  # fallback if status=completed
 }
 
@@ -2688,6 +2693,9 @@ _RESUME_HINTS = {
     "rate_limit":     "Wait 60 seconds and retry — or reduce request frequency.",
     "confusion":      "Clarify the task with more specific instructions.",
     "timeout":        "Break the task into smaller steps or increase timeout limits.",
+    "network_error":   "Check network connectivity and target service availability, then retry.",
+    "file_not_found":  "Verify the file path exists and the task has correct working directory context.",
+    "tool_error":      "Check MCP server logs for the failing tool and restart if needed.",
     "completed_clean": "Task completed successfully — no action needed.",
 }
 
@@ -2857,11 +2865,13 @@ async def garza_daily_brief() -> str:
         payload = {
             "contents": [{"role": "user", "parts": [{"text": (
                 f"{combined}\n\n"
-                "You are GARZA OS. Write a 5-sentence morning briefing for Jaden. "
-                "Lead with anything that needs his attention (zombie/stalled tasks). "
-                "Include yesterday's total spend and biggest task. "
-                "Note any decisions or insights from memory. "
-                "Be direct, no bullet points, no markdown."
+                "You are GARZA OS, Jaden Garza's AI operating system. Write a 5-sentence morning briefing. "
+                "Sentence 1: Lead with the most urgent item — zombie/stalled tasks that need killing or intervention. "
+                "Sentence 2: State yesterday's total spend and name the single most expensive task. "
+                "Sentence 3: Call out any active tasks worth monitoring right now. "
+                "Sentence 4: Surface any relevant memory or context from recent decisions. "
+                "Sentence 5: One concrete action Jaden should take in the next hour. "
+                "Be direct, specific, no bullet points, no markdown, no greetings."
             )}]}],
             "generationConfig": {"temperature": 0.3, "maxOutputTokens": 300},
         }
