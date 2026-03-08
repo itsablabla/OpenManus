@@ -689,7 +689,7 @@ async def manus_list_tasks(
                 line += f"  {url}"
             lines.append(line)
 
-        if has_more:
+        if result.get("has_more", False):
             lines.append("\nMore tasks available — reduce limit or use status_filter.")
 
         return "\n".join(lines)
