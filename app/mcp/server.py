@@ -3105,13 +3105,12 @@ async def garza_learn(query: str, limit: int = 10) -> str:
         query: What context to load (e.g. 'OpenManus MCP deployment', 'Jaden preferences')
         limit: Max memories to load (default 10)
     """
-    result = await fabric_call("agent_recall", {"query": query, "limit": limit})
+    result = await fabric_call("fabric_memory_search", {"query": query, "limit": limit})
 
-    memories = result.get("memories", [])
-    injection = result.get("system_prompt_injection", "")
-    count = result.get("count", len(memories))
+    hits = result.get("hits", result.get("memories", []))
+    total = result.get("total", len(hits))
 
-    if not memories:
+    if not hits:
         return (
             f"No memories found for: '{query}'\n"
             "This is a fresh context — no prior knowledge loaded.\n"
@@ -3119,29 +3118,27 @@ async def garza_learn(query: str, limit: int = 10) -> str:
         )
 
     lines = [
-        f"Loaded {count} memories for: '{query}'",
+        f"Loaded {len(hits)} memories for: '{query}' (total in store: {total})",
         "",
         "=== MEMORY CONTEXT ===",
     ]
 
-    for i, mem in enumerate(memories, 1):
-        mem_type = mem.get("memory_type", mem.get("type", "unknown"))
+    for i, mem in enumerate(hits, 1):
         text = mem.get("content", mem.get("text", ""))
-        importance = mem.get("importance", 0)
-        created = mem.get("created_at", "")
+        name = mem.get("name", "")
+        score = mem.get("score", 0)
+        created = mem.get("createdAt", mem.get("created_at", ""))
         age = _human_time(created) if created else ""
 
-        lines.append(f"{i}. [{mem_type.upper()}] {text[:200]}")
-        if importance or age:
-            meta = []
-            if importance:
-                meta.append(f"importance={importance:.1f}")
-            if age:
-                meta.append(age)
+        display = name if name and name != text[:len(name)] else text[:200]
+        lines.append(f"{i}. {display}")
+        meta = []
+        if score:
+            meta.append(f"relevance={score:.0f}")
+        if age:
+            meta.append(age)
+        if meta:
             lines.append(f"   ({', '.join(meta)})")
-
-    if injection:
-        lines.extend(["", "=== SYSTEM PROMPT INJECTION ===", injection])
 
     return "\n".join(lines)
 
@@ -3159,26 +3156,25 @@ async def garza_preferences(category: str = "all") -> str:
                   'briefing', 'code', or any custom tag
     """
     query = f"Jaden preferences {category}" if category != "all" else "Jaden preferences style format communication"
-    result = await fabric_call("agent_recall", {
+    result = await fabric_call("fabric_memory_search", {
         "query": query,
         "limit": 15,
-        "memory_types": ["Preference", "Style", "Habit"],
     })
 
-    memories = result.get("memories", [])
+    hits = result.get("hits", result.get("memories", []))
 
-    if not memories:
+    if not hits:
         return (
             "No preferences stored yet.\n"
             "Use garza_remember(memory_type='Preference') to store preferences as you learn them."
         )
 
     lines = [f"Jaden's Stored Preferences ({category})", "=" * 40]
-    for mem in memories:
+    for mem in hits:
         text = mem.get("content", mem.get("text", ""))
-        tags = mem.get("tags", [])
-        tag_str = f" [{', '.join(tags[:3])}]" if tags else ""
-        lines.append(f"• {text[:200]}{tag_str}")
+        name = mem.get("name", "")
+        display = name if name else text[:200]
+        lines.append(f"• {display}")
 
     return "\n".join(lines)
 
