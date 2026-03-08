@@ -2208,7 +2208,7 @@ def _is_subtask(task: dict) -> bool:
     """Heuristic: detect Wide Research / parallel subtasks."""
     title = (task.get("metadata") or {}).get("task_title", "")
     if not title:
-        title = task.get("title", "")
+        title = task.get("prompt") or task.get("title") or ""
     lower = title.lower()
     return any(kw in lower for kw in [
         "subtask", "sub-task", "wide research", "parallel", "research subtask",
@@ -2403,7 +2403,7 @@ async def garza_fleet_status(
                 lines.append(f"{state_icons.get(state, state.upper())} ({count}) — {descriptions.get(state, '')}")
 
             # Task line
-            name = task["registry"].get("name") or task["title"][:55]
+            name = task["registry"].get("name") or task.get("prompt","")[:55] or task.get("title","")[:55]
             age_secs = now_ts - task["updated_ts"]
             if age_secs < 60:
                 age_str = f"{int(age_secs)}s ago"
