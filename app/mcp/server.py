@@ -1399,3 +1399,522 @@ async def garza_status(
         return "\n".join(lines)
     except Exception as e:
         return handle_api_error(e)
+
+
+# ===========================================================================
+# GARZA OS Agent Intelligence Layer — Sprint 3 (2026-03-07)
+# Tool 1: manus_diagnose_task  — LLM-powered step trace analysis
+# Tool 2: manus_resume_task    — auto-unblock + enriched re-prompt
+# Tool 3: garza_flow_status    — multi-task workflow grouping view
+# ===========================================================================
+
+_DIAGNOSE_SYSTEM = """You are GARZA OS Diagnostics, an expert at analyzing Manus AI agent task traces.
+Given a step-by-step trace of what a Manus agent did, you must return a JSON object ONLY — no markdown, no explanation.
+
+The JSON must have exactly these fields:
+{
+  "status": "completed_clean" | "completed_with_issues" | "stalled" | "failed" | "auth_blocked" | "confused",
+  "blocked_at_step": "step number and short description, or null",
+  "blocker_type": "auth_missing" | "api_error" | "missing_context" | "tool_not_found" | "timeout" | "none",
+  "blocker_detail": "plain English explanation of exactly what was missing or wrong",
+  "suggested_fix": "what information or action would unblock it",
+  "resume_prompt": "a ready-to-use prompt string to feed back to Manus to continue with the right context injected"
+}
+
+Rules:
+- If the task completed successfully with no errors, use status=completed_clean and blocker_type=none
+- If you see auth errors (401, 403, API key issues), use status=auth_blocked and blocker_type=auth_missing
+- If the agent repeated the same action 3+ times without progress, use status=stalled
+- The resume_prompt must be specific and actionable — include the original goal plus any missing context
+- Return ONLY the JSON object, nothing else"""
+
+
+async def _diagnose_task_llm(task_id: str, step_trace: str, task_prompt: str) -> dict:
+    """Call Gemini to analyze a step trace and return a structured diagnosis."""
+    import requests as _req
+
+    gemini_key = os.environ.get("GEMINI_API_KEY", "")
+    if not gemini_key:
+        return {
+            "status": "unknown",
+            "blocked_at_step": None,
+            "blocker_type": "none",
+            "blocker_detail": "GEMINI_API_KEY not configured — cannot perform LLM diagnosis",
+            "suggested_fix": "Set GEMINI_API_KEY in Railway environment variables",
+            "resume_prompt": task_prompt,
+        }
+
+    user_content = f"""Task ID: {task_id}
+Original prompt: {task_prompt[:500]}
+
+Step trace ({len(step_trace)} chars):
+{step_trace[:8000]}
+
+Analyze this trace and return the JSON diagnosis."""
+
+    payload = {
+        "system_instruction": {"parts": [{"text": _DIAGNOSE_SYSTEM}]},
+        "contents": [{"role": "user", "parts": [{"text": user_content}]}],
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 1024},
+    }
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}"
+    try:
+        resp = _req.post(url, json=payload, timeout=30)
+        resp.raise_for_status()
+        raw = resp.json()
+        text = raw["candidates"][0]["content"]["parts"][0]["text"].strip()
+        # Strip markdown code fences if present
+        if text.startswith("```"):
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+        return json.loads(text.strip())
+    except Exception as exc:
+        return {
+            "status": "unknown",
+            "blocked_at_step": None,
+            "blocker_type": "none",
+            "blocker_detail": f"LLM diagnosis failed: {exc}",
+            "suggested_fix": "Check GEMINI_API_KEY and retry",
+            "resume_prompt": task_prompt,
+        }
+
+
+@mcp.tool()
+async def manus_diagnose_task(task_id: str) -> str:
+    """Diagnose a Manus task — analyze its step trace with an LLM and return a structured diagnosis.
+
+    Fetches the full step trace for the given task, passes it to Gemini 2.5 Flash,
+    and returns a JSON diagnosis with:
+      - status: completed_clean | completed_with_issues | stalled | failed | auth_blocked | confused
+      - blocked_at_step: step number and description where it got stuck (if applicable)
+      - blocker_type: auth_missing | api_error | missing_context | tool_not_found | timeout | none
+      - blocker_detail: plain English explanation of what was missing or wrong
+      - suggested_fix: what information or action would unblock it
+      - resume_prompt: ready-to-use prompt to feed back to Manus to continue the task
+
+    Args:
+        task_id: The Manus task ID to diagnose (e.g. 'ttCBV4aBMeU5k5U2GoekFh')
+    """
+    try:
+        # 1. Fetch task details to get the original prompt
+        task_resp = await manus_request("GET", f"/tasks/{task_id}")
+        task_data = task_resp if isinstance(task_resp, dict) else {}
+        output = task_data.get("output", [])
+        status = task_data.get("status", "unknown")
+        credits_used = task_data.get("credit_usage", {})
+        if isinstance(credits_used, dict):
+            credits_int = credits_used.get("credits", 0)
+        else:
+            credits_int = int(credits_used) if credits_used else 0
+
+        # Extract original prompt from first user message
+        task_prompt = "(unknown)"
+        for turn in output:
+            if turn.get("role") == "user":
+                content = turn.get("content", [])
+                if isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            task_prompt = part.get("text", "(unknown)")[:500]
+                            break
+                elif isinstance(content, str):
+                    task_prompt = content[:500]
+                break
+
+        # 2. Build step trace from output array
+        step_lines = []
+        for i, turn in enumerate(output):
+            role = turn.get("role", "?")
+            content = turn.get("content", [])
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict):
+                        ptype = part.get("type", "")
+                        if ptype == "text":
+                            txt = part.get("text", "")[:300]
+                            step_lines.append(f"Step {i+1} [{role}/text]: {txt}")
+                        elif ptype == "tool_use":
+                            tname = part.get("name", "?")
+                            tinput = str(part.get("input", ""))[:200]
+                            step_lines.append(f"Step {i+1} [{role}/tool_use]: {tname}({tinput})")
+                        elif ptype == "tool_result":
+                            tresult = str(part.get("content", ""))[:200]
+                            step_lines.append(f"Step {i+1} [{role}/tool_result]: {tresult}")
+            elif isinstance(content, str):
+                step_lines.append(f"Step {i+1} [{role}]: {content[:300]}")
+
+        step_trace = "\n".join(step_lines) if step_lines else f"No step trace available. Task status: {status}"
+
+        # 3. Call LLM for diagnosis
+        diagnosis = await _diagnose_task_llm(task_id, step_trace, task_prompt)
+
+        # 4. Format output
+        lines = [
+            f"GARZA OS — Task Diagnosis: {task_id}",
+            f"Status: {status} | Cost: {_usd(credits_int)} | Steps: {len(output)}",
+            "",
+            "=== LLM Diagnosis ===",
+            json.dumps(diagnosis, indent=2),
+            "",
+            "=== Raw Step Count ===",
+            f"{len(step_lines)} step turns analyzed",
+            f"Original prompt: {task_prompt[:200]}",
+            f"Task URL: https://manus.im/app/{task_id}",
+        ]
+        return "\n".join(lines)
+    except Exception as e:
+        return handle_api_error(e)
+
+
+@mcp.tool()
+async def manus_resume_task(task_id: str) -> str:
+    """Auto-diagnose a stuck/failed task and create an enriched resume task.
+
+    Steps:
+      1. Calls manus_diagnose_task to get blocker type and suggested fix
+      2. Calls garza_recall with a query derived from blocker_detail to search memory
+      3. Combines: original task prompt + diagnosis + any memory context found
+      4. Calls manus_create_task with an enriched prompt that includes all context
+      5. Returns: diagnosis summary, memory found (if any), and the new task ID
+
+    Args:
+        task_id: The Manus task ID to resume (e.g. 'ttCBV4aBMeU5k5U2GoekFh')
+    """
+    try:
+        # Step 1: Diagnose the task
+        diagnosis_text = await manus_diagnose_task(task_id)
+
+        # Extract the JSON diagnosis from the output
+        diagnosis = {}
+        try:
+            # Find the JSON block in the diagnosis output
+            start = diagnosis_text.find("{")
+            end = diagnosis_text.rfind("}") + 1
+            if start >= 0 and end > start:
+                diagnosis = json.loads(diagnosis_text[start:end])
+        except Exception:
+            pass
+
+        blocker_detail = diagnosis.get("blocker_detail", "task needs context to continue")
+        blocker_type = diagnosis.get("blocker_type", "none")
+        resume_prompt_base = diagnosis.get("resume_prompt", f"Continue task {task_id}")
+        suggested_fix = diagnosis.get("suggested_fix", "")
+        diag_status = diagnosis.get("status", "unknown")
+
+        # Step 2: Search memory for relevant context
+        memory_context = ""
+        memory_found = False
+        try:
+            # Build a targeted recall query from the blocker detail
+            recall_query = blocker_detail[:200] if blocker_detail else f"context for {task_id}"
+            memory_result = await garza_recall(query=recall_query)
+            if memory_result and "No memories found" not in memory_result and "not configured" not in memory_result:
+                memory_context = memory_result
+                memory_found = True
+        except Exception:
+            memory_context = ""
+
+        # Step 3: Build enriched prompt
+        enriched_parts = [
+            f"RESUME TASK — Continuing from task {task_id}",
+            f"",
+            f"Original goal: {resume_prompt_base}",
+            f"",
+            f"Diagnosis: This task was {diag_status}.",
+            f"Blocker: {blocker_detail}",
+            f"Suggested fix: {suggested_fix}",
+        ]
+        if memory_context:
+            enriched_parts.append(f"")
+            enriched_parts.append(f"Relevant memory context found:")
+            enriched_parts.append(memory_context[:1000])
+        enriched_parts.append(f"")
+        enriched_parts.append(f"Please complete the original goal using the above context. If you encounter the same blocker, use the suggested fix above.")
+
+        enriched_prompt = "\n".join(enriched_parts)
+
+        # Step 4: Create new task with enriched prompt
+        new_task_resp = await manus_request("POST", "/tasks", json={
+            "prompt": enriched_prompt,
+            "taskMode": "agent",
+            "agentProfile": "manus-1.6",
+        })
+        new_task_id = new_task_resp.get("id", new_task_resp.get("task_id", "unknown"))
+
+        # Step 5: Return summary
+        lines = [
+            f"GARZA OS — Task Resume: {task_id}",
+            f"",
+            f"=== Diagnosis Summary ===",
+            f"Status   : {diag_status}",
+            f"Blocker  : {blocker_type} — {blocker_detail[:200]}",
+            f"Fix      : {suggested_fix[:200]}",
+            f"",
+            f"=== Memory Context ===",
+            f"Found    : {'Yes — injected into new prompt' if memory_found else 'No — task relies on Manus finding resources itself'}",
+        ]
+        if memory_found:
+            lines.append(f"Preview  : {memory_context[:300]}")
+        lines.extend([
+            f"",
+            f"=== New Task Created ===",
+            f"New task ID : {new_task_id}",
+            f"Status      : pending",
+            f"URL         : https://manus.im/app/{new_task_id}",
+            f"",
+            f"Tip: Call manus_get_task(task_id='{new_task_id}') in 2-3 minutes to check progress.",
+        ])
+        return "\n".join(lines)
+    except Exception as e:
+        return handle_api_error(e)
+
+
+@mcp.tool()
+async def garza_flow_status(hours: int = 24) -> str:
+    """Show a high-level workflow view that groups Manus tasks into flows.
+
+    Since the Manus API does not expose parent_id, flows are inferred by:
+      - Title similarity: tasks with 'Wide Research Subtask', 'Subtask', 'Sub-task' in the
+        name group under the nearest named parent task created within ±10 minutes
+      - Time proximity: tasks created within 5 minutes of each other group together
+
+    Output per flow:
+      Flow: [parent task title]
+        Status: completed | running | stalled | mixed
+        Tasks: X total (Y completed, Z running, W failed)
+        Duration: Xh Xm total
+        Cost: $X.XX
+        Bottleneck: [description if any task is stalled/failed]
+        Link: [parent task URL]
+
+    Args:
+        hours: How many hours back to look (default: 24)
+    """
+    try:
+        import re as _re
+
+        # Fetch all tasks in the time window
+        resp = await manus_request("GET", "/tasks", params={"limit": 200})
+        all_tasks = resp.get("data", resp) if isinstance(resp, dict) else resp
+        if not isinstance(all_tasks, list):
+            return "No tasks found."
+
+        now_ts = time.time()
+        cutoff = now_ts - (hours * 3600)
+
+        # Filter to time window and parse timestamps
+        window_tasks = []
+        for t in all_tasks:
+            created = t.get("created_at", 0)
+            if isinstance(created, str):
+                try:
+                    created = datetime.fromisoformat(created.replace("Z", "+00:00")).timestamp()
+                except Exception:
+                    created = 0
+            if created >= cutoff:
+                t["_created_ts"] = created
+                window_tasks.append(t)
+
+        if not window_tasks:
+            return f"No tasks found in the last {hours}h."
+
+        # Sort by created_at ascending (oldest first for grouping)
+        window_tasks.sort(key=lambda t: t.get("_created_ts", 0))
+
+        # Subtask detection patterns
+        _SUBTASK_PATTERNS = [
+            r"wide research subtask",
+            r"subtask",
+            r"sub-task",
+            r"sub task",
+            r"research subtask",
+            r"parallel subtask",
+        ]
+
+        def _is_subtask(title: str) -> bool:
+            tl = title.lower()
+            return any(_re.search(p, tl) for p in _SUBTASK_PATTERNS)
+
+        def _title_similarity(a: str, b: str) -> float:
+            """Simple word overlap ratio."""
+            wa = set(a.lower().split())
+            wb = set(b.lower().split())
+            # Remove common subtask words
+            noise = {"wide", "research", "subtask", "sub-task", "task", "a", "the", "for", "of", "in", "and"}
+            wa -= noise
+            wb -= noise
+            if not wa or not wb:
+                return 0.0
+            return len(wa & wb) / max(len(wa), len(wb))
+
+        # Group tasks into flows
+        # A "flow" is anchored by a non-subtask task; subtasks attach to the nearest parent
+        flows: list[dict] = []  # list of {anchor: task, children: [task]}
+        orphans: list[dict] = []
+
+        for task in window_tasks:
+            title = task.get("title", task.get("id", ""))
+            ts = task.get("_created_ts", 0)
+
+            if _is_subtask(title):
+                # Find the best parent: non-subtask task within ±10 min with best title similarity
+                best_flow = None
+                best_score = -1.0
+                for flow in flows:
+                    anchor = flow["anchor"]
+                    anchor_ts = anchor.get("_created_ts", 0)
+                    time_diff = abs(ts - anchor_ts)
+                    if time_diff <= 600:  # ±10 minutes
+                        sim = _title_similarity(title, anchor.get("title", ""))
+                        # Also consider time proximity as a tiebreaker
+                        proximity_bonus = max(0, (600 - time_diff) / 600) * 0.3
+                        score = sim + proximity_bonus
+                        if score > best_score:
+                            best_score = score
+                            best_flow = flow
+                if best_flow is not None:
+                    best_flow["children"].append(task)
+                else:
+                    # No parent found — attach to most recent flow within 10 min
+                    for flow in reversed(flows):
+                        anchor_ts = flow["anchor"].get("_created_ts", 0)
+                        if abs(ts - anchor_ts) <= 600:
+                            flow["children"].append(task)
+                            break
+                    else:
+                        orphans.append(task)
+            else:
+                # Check if this task is close in time to an existing flow (within 5 min)
+                merged = False
+                for flow in reversed(flows):
+                    anchor_ts = flow["anchor"].get("_created_ts", 0)
+                    if abs(ts - anchor_ts) <= 300:  # 5 minutes
+                        # Only merge if titles are similar
+                        sim = _title_similarity(title, flow["anchor"].get("title", ""))
+                        if sim > 0.4:
+                            flow["children"].append(task)
+                            merged = True
+                            break
+                if not merged:
+                    flows.append({"anchor": task, "children": []})
+
+        # Format output
+        total_cost = 0
+        total_flows = len(flows)
+        attention_items = []
+
+        output_lines = [
+            f"GARZA OS — Flow Status (last {hours}h)",
+            f"{'='*50}",
+            "",
+        ]
+
+        for flow in sorted(flows, key=lambda f: f["anchor"].get("_created_ts", 0), reverse=True):
+            anchor = flow["anchor"]
+            all_flow_tasks = [anchor] + flow["children"]
+
+            # Aggregate stats
+            statuses_in_flow = [t.get("status", "unknown") for t in all_flow_tasks]
+            n_completed = statuses_in_flow.count("completed")
+            n_running = sum(1 for s in statuses_in_flow if s in ("running", "pending"))
+            n_failed = statuses_in_flow.count("failed")
+            n_total = len(all_flow_tasks)
+
+            # Flow status
+            if n_failed > 0 and n_running == 0:
+                flow_status = "failed"
+            elif n_running > 0 and n_failed > 0:
+                flow_status = "mixed"
+            elif n_running > 0:
+                flow_status = "running"
+            elif n_completed == n_total:
+                flow_status = "completed"
+            else:
+                flow_status = "mixed"
+
+            # Cost
+            flow_credits = 0
+            for t in all_flow_tasks:
+                cu = t.get("credit_usage", {})
+                if isinstance(cu, dict):
+                    flow_credits += cu.get("credits", 0)
+                elif cu:
+                    try:
+                        flow_credits += int(cu)
+                    except Exception:
+                        pass
+            total_cost += flow_credits
+
+            # Duration: from earliest created to latest updated
+            ts_list = [t.get("_created_ts", 0) for t in all_flow_tasks]
+            updated_list = []
+            for t in all_flow_tasks:
+                upd = t.get("updated_at", 0)
+                if isinstance(upd, str):
+                    try:
+                        upd = datetime.fromisoformat(upd.replace("Z", "+00:00")).timestamp()
+                    except Exception:
+                        upd = 0
+                updated_list.append(upd)
+            start_ts = min(ts_list) if ts_list else 0
+            end_ts = max(updated_list) if updated_list else 0
+            duration_secs = max(0, end_ts - start_ts)
+            if duration_secs < 60:
+                duration_str = f"{int(duration_secs)}s"
+            elif duration_secs < 3600:
+                duration_str = f"{int(duration_secs//60)}m {int(duration_secs%60)}s"
+            else:
+                h = int(duration_secs // 3600)
+                m = int((duration_secs % 3600) // 60)
+                duration_str = f"{h}h {m}m"
+
+            # Bottleneck
+            bottleneck = ""
+            if n_failed > 0:
+                failed_tasks = [t for t in all_flow_tasks if t.get("status") == "failed"]
+                bottleneck = f"{n_failed} task(s) failed — run manus_diagnose_task to investigate"
+            elif n_running > 0:
+                running_tasks = [t for t in all_flow_tasks if t.get("status") in ("running", "pending")]
+                oldest_running = min(running_tasks, key=lambda t: t.get("_created_ts", now_ts))
+                run_secs = now_ts - oldest_running.get("_created_ts", now_ts)
+                if run_secs > 1800:  # >30 min
+                    bottleneck = f"⚠️ Task running {int(run_secs//60)}m — possible runaway"
+                    attention_items.append(f"  {anchor.get('title','?')[:50]} — runaway task ({int(run_secs//60)}m)")
+
+            anchor_id = anchor.get("id", "?")
+            anchor_title = anchor.get("title", anchor_id)[:60]
+
+            status_icon = {"completed": "✅", "running": "🟡", "failed": "🔴", "mixed": "🟠", "stalled": "⚠️"}.get(flow_status, "❓")
+
+            output_lines.append(f"{status_icon} Flow: {anchor_title}")
+            output_lines.append(f"   Status   : {flow_status}")
+            output_lines.append(f"   Tasks    : {n_total} total ({n_completed} completed, {n_running} running, {n_failed} failed)")
+            output_lines.append(f"   Duration : {duration_str}")
+            output_lines.append(f"   Cost     : {_usd(flow_credits)}")
+            if bottleneck:
+                output_lines.append(f"   Bottleneck: {bottleneck}")
+            output_lines.append(f"   Link     : https://manus.im/app/{anchor_id}")
+            output_lines.append("")
+
+        # Orphan subtasks (couldn't be grouped)
+        if orphans:
+            output_lines.append(f"⚪ Ungrouped subtasks: {len(orphans)}")
+            for o in orphans[:5]:
+                output_lines.append(f"   - {o.get('title', o.get('id','?'))[:60]}")
+            if len(orphans) > 5:
+                output_lines.append(f"   ... and {len(orphans)-5} more")
+            output_lines.append("")
+
+        # Top-level summary
+        output_lines.insert(3, f"Summary: {total_flows} flows | Total spend: {_usd(total_cost)} | {len(orphans)} ungrouped subtasks")
+        output_lines.insert(4, "")
+        if attention_items:
+            output_lines.insert(5, "⚠️  Needs Attention:")
+            for item in attention_items:
+                output_lines.insert(6, item)
+            output_lines.insert(7, "")
+
+        return "\n".join(output_lines)
+    except Exception as e:
+        return handle_api_error(e)
