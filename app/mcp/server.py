@@ -40,7 +40,7 @@ from app.mcp.manus_models import (
 )
 
 logger = logging.getLogger(__name__)
-mcp = FastMCP("OpenManus Hybrid MCP Server v17 — Memory-Native, No Dropbox")
+mcp = FastMCP("OpenManus Hybrid MCP Server v18 — Full Memory Suite")
 
 # ---------------------------------------------------------------------------
 # Credit → USD conversion
@@ -3475,3 +3475,194 @@ async def garza_memory_populate(max_tasks: int = 50, dry_run: bool = True) -> st
 
     except Exception as e:
         return handle_api_error(e)
+
+
+# ---------------------------------------------------------------------------
+# Sprint 6 — Phase 1: Memory Deduplication
+# Finds and removes near-duplicate memories in Fabric.so
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def garza_memory_dedupe(dry_run: bool = True, similarity_threshold: float = 0.85) -> str:
+    """
+    Find and remove near-duplicate memories from the Fabric.so memory store.
+
+    Compares memory names/content using normalized string similarity.
+    Keeps the most recent copy of each duplicate group and deletes the rest.
+
+    Args:
+        dry_run: If True (default), shows duplicates without deleting. Set False to delete.
+        similarity_threshold: 0.0–1.0, how similar two memories must be to count as duplicates
+                              (default 0.85 = 85% similar)
+    """
+    try:
+        import difflib
+
+        # Fetch all memories via fabric_memory_search with broad query
+        result = await fabric_call("fabric_memory_search", {"query": "garza-os", "limit": 100})
+        hits = result.get("hits", [])
+        total = result.get("total", len(hits))
+
+        if not hits:
+            return "No memories found to deduplicate."
+
+        # Build (id, name, content, createdAt) list
+        mems = []
+        for h in hits:
+            mems.append({
+                "id": h.get("id", ""),
+                "name": h.get("name", ""),
+                "content": h.get("content", ""),
+                "createdAt": h.get("createdAt", ""),
+            })
+
+        # Find duplicate groups using name similarity
+        duplicate_groups: list = []
+        used: set = set()
+
+        for i, a in enumerate(mems):
+            if a["id"] in used:
+                continue
+            group = [a]
+            key_a = (a["name"] or a["content"])[:120].lower().strip()
+            for j, b in enumerate(mems):
+                if i == j or b["id"] in used:
+                    continue
+                key_b = (b["name"] or b["content"])[:120].lower().strip()
+                ratio = difflib.SequenceMatcher(None, key_a, key_b).ratio()
+                if ratio >= similarity_threshold:
+                    group.append(b)
+            if len(group) > 1:
+                for m in group:
+                    used.add(m["id"])
+                duplicate_groups.append(group)
+
+        if not duplicate_groups:
+            return (
+                f"No duplicates found in {len(hits)} memories scanned "
+                f"(threshold: {similarity_threshold:.0%}).\n"
+                f"Memory store is clean."
+            )
+
+        # For each group, keep the newest, delete the rest
+        to_delete: list = []
+        for group in duplicate_groups:
+            # Sort by createdAt descending — keep first (newest)
+            group_sorted = sorted(group, key=lambda x: x["createdAt"], reverse=True)
+            to_delete.extend(group_sorted[1:])  # all but newest
+
+        lines = [
+            f"Memory Deduplication — {len(hits)}/{total} memories scanned",
+            f"{'DRY RUN — nothing deleted' if dry_run else 'LIVE RUN — deleting duplicates'}",
+            f"Threshold: {similarity_threshold:.0%}",
+            "",
+            f"Duplicate groups found: {len(duplicate_groups)}",
+            f"Memories to delete: {len(to_delete)}",
+            "",
+        ]
+
+        for group in duplicate_groups:
+            group_sorted = sorted(group, key=lambda x: x["createdAt"], reverse=True)
+            keep = group_sorted[0]
+            delete_list = group_sorted[1:]
+            lines.append(f"GROUP: '{(keep['name'] or keep['content'])[:70]}'")
+            lines.append(f"  KEEP  ({keep['createdAt'][:10]}): {keep['id'][:8]}...")
+            for d in delete_list:
+                lines.append(f"  DELETE ({d['createdAt'][:10]}): {d['id'][:8]}... '{(d['name'] or d['content'])[:50]}'")
+            lines.append("")
+
+        if not dry_run:
+            deleted = 0
+            failed = 0
+            for m in to_delete:
+                r = await fabric_call("fabric_memory_delete", {"memory_id": m["id"]})
+                if r is not None:
+                    deleted += 1
+                else:
+                    failed += 1
+            lines.append(f"✅ Deleted {deleted}/{len(to_delete)} duplicates")
+            if failed:
+                lines.append(f"⚠️  Failed to delete {failed} memories")
+        else:
+            lines.append("Run with dry_run=False to delete these duplicates.")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        return handle_api_error(e)
+
+
+# ---------------------------------------------------------------------------
+# Sprint 6 — Phase 2: Proactive Memory Injection
+# Loads relevant memories into context at the start of any session/query
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def garza_memory_inject(context_hint: str = "", limit: int = 8) -> str:
+    """
+    Proactively load the most relevant memories into context before starting work.
+
+    Call this at the beginning of any session or before a complex task to prime
+    the agent with relevant past decisions, preferences, and insights.
+
+    Returns a formatted memory block ready to inject into a system prompt or
+    prepend to any tool's context.
+
+    Args:
+        context_hint: Optional topic hint to focus the memory search
+                      (e.g. 'Verizon billing', 'MCP deployment', 'Nomad churn')
+                      Leave empty for a broad recent-context load.
+        limit: Max memories to inject (default 8, max 20)
+    """
+    limit = min(limit, 20)
+
+    # Build query — use hint if provided, else broad recent context
+    query = context_hint.strip() if context_hint.strip() else (
+        "Jaden preferences decisions insights recent context garza-os"
+    )
+
+    result = await fabric_call("fabric_memory_search", {"query": query, "limit": limit})
+    hits = result.get("hits", [])
+    total = result.get("total", 0)
+
+    if not hits:
+        return (
+            "## GARZA OS Memory Context\n"
+            "(No relevant memories found — fresh context)\n"
+            "Use garza_remember() to start building persistent memory."
+        )
+
+    lines = [
+        "## GARZA OS Memory Context",
+        f"Loaded {len(hits)} memories" + (f" for: '{context_hint}'" if context_hint else " (broad context)"),
+        f"Total in store: {total}",
+        "",
+    ]
+
+    for i, mem in enumerate(hits, 1):
+        name = mem.get("name", "")
+        content = mem.get("content", "")
+        created = mem.get("createdAt", "")
+        score = mem.get("score", 0)
+        age = _human_time(created) if created else ""
+
+        display = name if name else content[:160]
+        lines.append(f"{i}. {display}")
+        meta = []
+        if score:
+            meta.append(f"relevance={score:.0f}")
+        if age:
+            meta.append(age)
+        if meta:
+            lines.append(f"   ({', '.join(meta)})")
+
+    lines.extend([
+        "",
+        "---",
+        "Inject this block into your system prompt or prepend to task context.",
+        "Call garza_remember() to add new memories during this session.",
+    ])
+
+    return "\n".join(lines)
