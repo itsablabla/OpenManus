@@ -40,7 +40,7 @@ from app.mcp.manus_models import (
 )
 
 logger = logging.getLogger(__name__)
-mcp = FastMCP("OpenManus Hybrid MCP Server v16 — Memory Integration")
+mcp = FastMCP("OpenManus Hybrid MCP Server v17 — Memory-Native, No Dropbox")
 
 # ---------------------------------------------------------------------------
 # Credit → USD conversion
@@ -1007,53 +1007,7 @@ async def fabric_call(tool_name: str, params: dict) -> dict:
     return await _fabric.call(tool_name, params)
 
 
-@mcp.tool()
-async def garza_recall(query: str, limit: int = 5) -> str:
-    """
-    Search GARZA OS long-term memory for context across all past sessions.
-    Powered by fabric-so-mcp AutoMem memory layer.
-
-    Use this to answer:
-      - 'When did I last research Verizon billing?'
-      - 'What decisions have been made about the MCP server?'
-      - 'What does Jaden prefer for briefing format?'
-      - 'What has Manus learned about my preferences?'
-
-    Args:
-        query: Natural language question to search memory
-        limit: Max memories to return (default 5)
-    """
-    if not _FABRIC_SO_URL:
-        return (
-            "Memory layer not configured. "
-            "Set FABRIC_SO_MCP_URL and FABRIC_SO_API_KEY in Railway environment variables "
-            "to enable cross-session memory recall."
-        )
-    try:
-        results = await fabric_call("agent_recall", {"query": query, "limit": limit})
-        memories = results.get("memories", results.get("results", []))
-
-        if not memories:
-            return f"No memories found matching: '{query}'"
-
-        lines = [f"Found {len(memories)} memories for: '{query}'"]
-        for mem in memories:
-            mem_type = mem.get("type", mem.get("memory_type", "unknown"))
-            text = mem.get("text", mem.get("content", ""))
-            created = mem.get("created_at", "")
-            created_human = _human_time(created) if created else ""
-            importance = mem.get("importance", "")
-
-            line = f"  [{mem_type.upper()}] {text}"
-            if created_human:
-                line += f" ({created_human})"
-            if importance:
-                line += f" [importance: {importance}]"
-            lines.append(line)
-
-        return "\n".join(lines)
-    except Exception as e:
-        return f"Error recalling from memory: {e}"
+# garza_recall removed in v17 — use garza_learn instead (superset with injection block)
 
 
 # ---------------------------------------------------------------------------
@@ -1775,7 +1729,7 @@ async def manus_resume_task(task_id: str) -> str:
 
     Steps:
       1. Calls manus_diagnose_task to get blocker type and suggested fix
-      2. Calls garza_recall with a query derived from blocker_detail to search memory
+      2. Calls garza_learn with a query derived from blocker_detail to search memory
       3. Combines: original task prompt + diagnosis + any memory context found
       4. Calls manus_create_task with an enriched prompt that includes all context
       5. Returns: diagnosis summary, memory found (if any), and the new task ID
@@ -1810,7 +1764,7 @@ async def manus_resume_task(task_id: str) -> str:
         try:
             # Build a targeted recall query from the blocker detail
             recall_query = blocker_detail[:200] if blocker_detail else f"context for {task_id}"
-            memory_result = await garza_recall(query=recall_query)
+            memory_result = await garza_learn(query=recall_query, limit=5)
             if memory_result and "No memories found" not in memory_result and "not configured" not in memory_result:
                 memory_context = memory_result
                 memory_found = True
@@ -2151,18 +2105,7 @@ def _ensure_data_dir() -> None:
 
 
 def _registry_load() -> list:
-    """Load agent registry. Uses Dropbox if DROPBOX_API_KEY set, else local file."""
-    # Try Dropbox first (survives container restarts)
-    dbx_key = os.environ.get("DROPBOX_API_KEY", "")
-    if dbx_key:
-        try:
-            import dropbox
-            dbx = dropbox.Dropbox(dbx_key)
-            _, res = dbx.files_download("/garza-os/agent_registry.json")
-            return json.loads(res.content)
-        except Exception:
-            pass  # Fall through to local file
-    # Local file fallback
+    """Load agent registry from local file (Fabric.so is write-only for registry)."""
     _ensure_data_dir()
     try:
         with open(_REGISTRY_PATH) as f:
@@ -2172,7 +2115,7 @@ def _registry_load() -> list:
 
 
 def _registry_save(entries: list) -> None:
-    """Persist agent registry. Uses Dropbox if DROPBOX_API_KEY set, also writes local file."""
+    """Persist agent registry to local file and async-write a snapshot to Fabric.so memory."""
     # Always write local file
     _ensure_data_dir()
     try:
@@ -2180,17 +2123,18 @@ def _registry_save(entries: list) -> None:
             json.dump(entries, f, indent=2)
     except Exception:
         pass
-    # Also write to Dropbox if available (persistent across restarts)
-    dbx_key = os.environ.get("DROPBOX_API_KEY", "")
-    if dbx_key:
-        try:
-            import dropbox
-            from dropbox.files import WriteMode
-            dbx = dropbox.Dropbox(dbx_key)
-            content = json.dumps(entries, indent=2).encode("utf-8")
-            dbx.files_upload(content, "/garza-os/agent_registry.json", mode=WriteMode.overwrite)
-        except Exception:
-            pass  # Non-fatal — local file is the fallback
+    # Fire-and-forget snapshot to Fabric.so (survives container restarts via memory)
+    try:
+        summary = json.dumps([{"agent_id": e.get("agent_id"), "task_id": e.get("task_id"),
+                               "name": e.get("name"), "purpose": e.get("purpose", "")[:80]}
+                              for e in entries], separators=(",", ":"))
+        asyncio.ensure_future(fabric_call("agent_remember_context", {
+            "content": f"Agent registry snapshot ({len(entries)} agents): {summary[:800]}",
+            "importance": 0.5,
+            "tags": ["agent-registry", "garza-os", "registry-snapshot"],
+        }))
+    except Exception:
+        pass  # Non-fatal — local file is the primary store
 
 
 def _slugify(text: str) -> str:
@@ -3029,7 +2973,7 @@ async def garza_daily_brief() -> str:
         memory_text = ""
         try:
             memory_text = await asyncio.wait_for(
-                garza_recall(query="recent decisions and insights", limit=3), timeout=5
+                garza_learn(query="recent decisions and insights", limit=3), timeout=5
             )
         except (asyncio.TimeoutError, Exception):
             memory_text = "(memory unavailable)"
@@ -3161,7 +3105,7 @@ async def garza_learn(query: str, limit: int = 10) -> str:
         query: What context to load (e.g. 'OpenManus MCP deployment', 'Jaden preferences')
         limit: Max memories to load (default 10)
     """
-    result = await fabric_call("agent_recall", {"query": query, "limit": limit, "agent_id": "garza-os"})
+    result = await fabric_call("agent_recall", {"query": query, "limit": limit})
 
     memories = result.get("memories", [])
     injection = result.get("system_prompt_injection", "")
@@ -3218,7 +3162,6 @@ async def garza_preferences(category: str = "all") -> str:
     result = await fabric_call("agent_recall", {
         "query": query,
         "limit": 15,
-        "agent_id": "garza-os",
         "memory_types": ["Preference", "Style", "Habit"],
     })
 
@@ -3461,7 +3404,7 @@ async def garza_memory_populate(max_tasks: int = 50, dry_run: bool = True) -> st
                     f"Fleet analysis: {len(tasks)} completed tasks analyzed. "
                     f"Average cost: {_usd(avg_cost * 200)}. "
                     f"Total spend: {_usd(total_cost)}. "
-                    f"Top expensive task: {expensive[0][1] if expensive else 'none'} at ${expensive[0][0]:.2f}."
+                    + (f"Top expensive task: '{expensive[0][1]}' at ${expensive[0][0]:.2f}." if expensive else "No tasks over $5.")
                 ),
                 "importance": 0.6,
                 "tags": ["fleet-analysis", "cost-pattern", "garza-os"],
