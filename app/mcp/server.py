@@ -1531,16 +1531,20 @@ async def manus_diagnose_task(task_id: str) -> str:
                 for part in content:
                     if isinstance(part, dict):
                         ptype = part.get("type", "")
-                        if ptype == "text":
+                        # Manus API uses output_text / output_file (not bare "text")
+                        if ptype in ("text", "output_text"):
                             txt = part.get("text", "")[:300]
                             step_lines.append(f"Step {i+1} [{role}/text]: {txt}")
-                        elif ptype == "tool_use":
+                        elif ptype in ("tool_use", "output_tool_use"):
                             tname = part.get("name", "?")
                             tinput = str(part.get("input", ""))[:200]
                             step_lines.append(f"Step {i+1} [{role}/tool_use]: {tname}({tinput})")
-                        elif ptype == "tool_result":
+                        elif ptype in ("tool_result", "output_tool_result"):
                             tresult = str(part.get("content", ""))[:200]
                             step_lines.append(f"Step {i+1} [{role}/tool_result]: {tresult}")
+                        elif ptype == "output_file":
+                            fname = part.get("fileUrl", "").split("/")[-1].split("?")[0][:100]
+                            step_lines.append(f"Step {i+1} [{role}/file]: {fname}")
             elif isinstance(content, str):
                 step_lines.append(f"Step {i+1} [{role}]: {content[:300]}")
 
@@ -1695,7 +1699,7 @@ async def garza_flow_status(hours: int = 24) -> str:
         import re as _re
 
         # Fetch all tasks in the time window
-        resp = await manus_request("GET", "/tasks", params={"limit": 200})
+        resp = await manus_request("GET", "/tasks", params={"limit": 100})
         all_tasks = resp.get("data", resp) if isinstance(resp, dict) else resp
         if not isinstance(all_tasks, list):
             return "No tasks found."
