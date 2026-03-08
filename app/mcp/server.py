@@ -74,6 +74,7 @@ _PUBLIC_PATHS = {
     "/oauth/authorize",
     "/oauth/token",
     "/",
+    "/health",
 }
 
 _TASK_LOG_PATH = "/tmp/task_log.jsonl"
