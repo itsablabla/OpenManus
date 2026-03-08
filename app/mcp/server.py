@@ -1790,7 +1790,7 @@ async def garza_flow_status(hours: int = 24) -> str:
         orphans: list[dict] = []
 
         for task in window_tasks:
-            title = task.get("title", task.get("id", ""))
+            title = task.get("prompt", task.get("title", task.get("id", "")))[:80]
             ts = task.get("_created_ts", 0)
 
             if _is_subtask(title):
@@ -1802,7 +1802,7 @@ async def garza_flow_status(hours: int = 24) -> str:
                     anchor_ts = anchor.get("_created_ts", 0)
                     time_diff = abs(ts - anchor_ts)
                     if time_diff <= 600:  # ±10 minutes
-                        sim = _title_similarity(title, anchor.get("title", ""))
+                        sim = _title_similarity(title, anchor.get("prompt", anchor.get("title", "")))
                         # Also consider time proximity as a tiebreaker
                         proximity_bonus = max(0, (600 - time_diff) / 600) * 0.3
                         score = sim + proximity_bonus
@@ -1827,7 +1827,7 @@ async def garza_flow_status(hours: int = 24) -> str:
                     anchor_ts = flow["anchor"].get("_created_ts", 0)
                     if abs(ts - anchor_ts) <= 300:  # 5 minutes
                         # Only merge if titles are similar
-                        sim = _title_similarity(title, flow["anchor"].get("title", ""))
+                        sim = _title_similarity(title, flow["anchor"].get("prompt", flow["anchor"].get("title", "")))
                         if sim > 0.4:
                             flow["children"].append(task)
                             merged = True
@@ -1919,10 +1919,11 @@ async def garza_flow_status(hours: int = 24) -> str:
                 run_secs = now_ts - oldest_running.get("_created_ts", now_ts)
                 if run_secs > 1800:  # >30 min
                     bottleneck = f"⚠️ Task running {int(run_secs//60)}m — possible runaway"
-                    attention_items.append(f"  {anchor.get('title','?')[:50]} — runaway task ({int(run_secs//60)}m)")
+                    _atitle = anchor.get('prompt', anchor.get('title', anchor.get('id', '?')))[:50]
+                    attention_items.append(f"  {_atitle} — runaway task ({int(run_secs//60)}m)")
 
             anchor_id = anchor.get("id", "?")
-            anchor_title = anchor.get("title", anchor_id)[:60]
+            anchor_title = (anchor.get("prompt") or anchor.get("title") or anchor_id)[:60]
 
             status_icon = {"completed": "✅", "running": "🟡", "failed": "🔴", "mixed": "🟠", "stalled": "⚠️"}.get(flow_status, "❓")
 
@@ -1940,7 +1941,7 @@ async def garza_flow_status(hours: int = 24) -> str:
         if orphans:
             output_lines.append(f"⚪ Ungrouped subtasks: {len(orphans)}")
             for o in orphans[:5]:
-                output_lines.append(f"   - {o.get('title', o.get('id','?'))[:60]}")
+                output_lines.append(f"   - {(o.get('prompt') or o.get('title') or o.get('id','?'))[:60]}")
             if len(orphans) > 5:
                 output_lines.append(f"   ... and {len(orphans)-5} more")
             output_lines.append("")
@@ -1980,7 +1981,18 @@ def _ensure_data_dir() -> None:
 
 
 def _registry_load() -> list:
-    """Load agent registry from disk. Returns [] if missing."""
+    """Load agent registry. Uses Dropbox if DROPBOX_API_KEY set, else local file."""
+    # Try Dropbox first (survives container restarts)
+    dbx_key = os.environ.get("DROPBOX_API_KEY", "")
+    if dbx_key:
+        try:
+            import dropbox
+            dbx = dropbox.Dropbox(dbx_key)
+            _, res = dbx.files_download("/garza-os/agent_registry.json")
+            return json.loads(res.content)
+        except Exception:
+            pass  # Fall through to local file
+    # Local file fallback
     _ensure_data_dir()
     try:
         with open(_REGISTRY_PATH) as f:
@@ -1990,10 +2002,25 @@ def _registry_load() -> list:
 
 
 def _registry_save(entries: list) -> None:
-    """Persist agent registry to disk."""
+    """Persist agent registry. Uses Dropbox if DROPBOX_API_KEY set, also writes local file."""
+    # Always write local file
     _ensure_data_dir()
-    with open(_REGISTRY_PATH, "w") as f:
-        json.dump(entries, f, indent=2)
+    try:
+        with open(_REGISTRY_PATH, "w") as f:
+            json.dump(entries, f, indent=2)
+    except Exception:
+        pass
+    # Also write to Dropbox if available (persistent across restarts)
+    dbx_key = os.environ.get("DROPBOX_API_KEY", "")
+    if dbx_key:
+        try:
+            import dropbox
+            from dropbox.files import WriteMode
+            dbx = dropbox.Dropbox(dbx_key)
+            content = json.dumps(entries, indent=2).encode("utf-8")
+            dbx.files_upload(content, "/garza-os/agent_registry.json", mode=WriteMode.overwrite)
+        except Exception:
+            pass  # Non-fatal — local file is the fallback
 
 
 def _slugify(text: str) -> str:
@@ -2168,9 +2195,9 @@ def _classify_task_state(task: dict, now_ts: float) -> str:
     if status in ("failed", "error"):
         return "failed"
     if status in ("running", "pending"):
-        if age_secs < 1800:  # < 30 min
+        if age_secs < 2700:  # < 45 min
             return "active"
-        elif age_secs < 7200:  # 30 min – 2h
+        elif age_secs < 7200:  # 45 min – 2h
             return "stalled"
         else:  # > 2h
             return "zombie"
@@ -2240,7 +2267,7 @@ async def garza_fleet_status(
                 except (TypeError, ValueError):
                     credits_int = 0
                 meta = t.get("metadata") or {}
-                title = meta.get("task_title") or t.get("title") or t.get("id", "?")
+                title = meta.get("task_title") or t.get("prompt") or t.get("title") or t.get("id", "?")
                 created_raw = t.get("created_at") or 0
                 updated_raw = t.get("updated_at") or created_raw
                 try:
@@ -2273,7 +2300,7 @@ async def garza_fleet_status(
                 tid = t.get("id", "?")
                 status = t.get("status", "?")
                 meta = t.get("metadata") or {}
-                title = meta.get("task_title") or t.get("title", "")[:50]
+                title = meta.get("task_title") or t.get("prompt", "") or t.get("title", "")[:50]
                 lines.append(f"  {tid}  [{status}]  {title}")
             if len(all_tasks) > 20:
                 lines.append(f"  ... and {len(all_tasks)-20} more")
@@ -2549,23 +2576,15 @@ async def manus_kill_zombies(
     try:
         now_ts = time.time()
 
-        # Fetch all tasks
+        # Fetch all tasks (Manus API max limit=100, no pagination)
         all_tasks = []
-        page = 1
-        while True:
-            try:
-                result = await manus_request("GET", "/tasks", params={"limit": 100, "page": page})
-            except Exception:
-                break
-            batch = result.get("tasks", result.get("data", []))
-            if not batch:
-                break
-            all_tasks.extend(batch)
-            if not result.get("has_more", False) or len(batch) < 100:
-                break
-            page += 1
-            if page > 20:
-                break
+        try:
+            result = await manus_request("GET", "/tasks", params={"limit": 100})
+            all_tasks = result.get("data", result.get("tasks", []))
+            if not isinstance(all_tasks, list):
+                all_tasks = []
+        except Exception as e:
+            return f"Failed to fetch tasks: {e}"
 
         # Find zombies
         zombies = []
@@ -2577,7 +2596,7 @@ async def manus_kill_zombies(
                 except (TypeError, ValueError):
                     credits_int = 0
                 meta = t.get("metadata") or {}
-                title = meta.get("task_title") or t.get("title") or t.get("id", "?")
+                title = meta.get("task_title") or t.get("prompt") or t.get("title") or t.get("id", "?")
                 updated_raw = t.get("updated_at") or t.get("created_at") or 0
                 try:
                     updated_ts = float(updated_raw)
@@ -2648,7 +2667,13 @@ BLOCKER_PATTERNS = {
     "auth_railway":     [r"railway", r"401", r"unauthorized", r"no.*token"],
     "auth_generic":     [r"api.key", r"authentication", r"permission denied", r"403"],
     "missing_tool":     [r"no.*tool", r"tool not found", r"mcp.*unavailable"],
-    "waiting_human":    [r"want me to", r"shall i", r"would you like", r"confirm", r"proceed\?"],
+    "waiting_human":    [r"want me to", r"shall i", r"would you like", r"confirm", r"proceed\?",
+                         r"what.*ip", r"what.*subnet", r"what.*range", r"what.*address",
+                         r"please provide", r"please share", r"please specify",
+                         r"need.*from you", r"waiting.*input", r"waiting.*response",
+                         r"could you.*provide", r"can you.*provide", r"can you.*share",
+                         r"let me know", r"what.*credentials", r"what.*password",
+                         r"what.*token", r"what.*key"],
     "rate_limit":       [r"rate limit", r"too many requests", r"429", r"quota"],
     "confusion":        [r"i'm not sure", r"unclear", r"could you clarify", r"what do you mean"],
     "timeout":          [r"timed out", r"took too long", r"exceeded.*time"],
@@ -2792,17 +2817,25 @@ async def garza_daily_brief() -> str:
     try:
         import requests as _req
 
-        # 1. Fleet status (attention items only)
-        fleet_text = await garza_fleet_status(filter="attention")
+        # 1. Fleet status (attention items only) — 10s timeout
+        try:
+            fleet_text = await asyncio.wait_for(garza_fleet_status(filter="attention"), timeout=10)
+        except asyncio.TimeoutError:
+            fleet_text = "(fleet status timed out)"
 
-        # 2. Cost summary (yesterday)
-        cost_text = await manus_cost_summary(hours_back=24, group_by="day")
+        # 2. Cost summary (yesterday) — 8s timeout
+        try:
+            cost_text = await asyncio.wait_for(manus_cost_summary(hours_back=24, group_by="day"), timeout=8)
+        except asyncio.TimeoutError:
+            cost_text = "(cost summary timed out)"
 
-        # 3. Memory recall
+        # 3. Memory recall — 5s timeout
         memory_text = ""
         try:
-            memory_text = await garza_recall(query="recent decisions and insights", limit=3)
-        except Exception:
+            memory_text = await asyncio.wait_for(
+                garza_recall(query="recent decisions and insights", limit=3), timeout=5
+            )
+        except (asyncio.TimeoutError, Exception):
             memory_text = "(memory unavailable)"
 
         # 4. Gemini briefing
@@ -2833,7 +2866,7 @@ async def garza_daily_brief() -> str:
             "generationConfig": {"temperature": 0.3, "maxOutputTokens": 300},
         }
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}"
-        resp = _req.post(url, json=payload, timeout=15)
+        resp = _req.post(url, json=payload, timeout=10)
         resp.raise_for_status()
         raw = resp.json()
         briefing = raw["candidates"][0]["content"]["parts"][0]["text"].strip()
