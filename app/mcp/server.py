@@ -875,49 +875,54 @@ async def manus_get_steps(task_id: str) -> str:
         task_id: The task ID to inspect
     """
     try:
-        # Try /steps first, fall back to /events
-        try:
-            result = await manus_request("GET", f"/tasks/{task_id}/steps")
-        except Exception:
-            result = await manus_request("GET", f"/tasks/{task_id}/events")
+        # The Manus API does not expose a /steps endpoint.
+        # The conversation turns (output array) in the task detail ARE the step trace.
+        detail = await manus_request("GET", f"/tasks/{task_id}")
+        output = detail.get("output", [])
+        meta = detail.get("metadata") or {}
+        title = meta.get("task_title", "(no title)")
+        status = detail.get("status", "unknown")
+        credits = detail.get("credit_usage", 0)
+        task_url = meta.get("task_url", "")
 
-        steps = result.get("steps", result.get("events", []))
-
-        if not steps:
-            # Fall back to task detail to at least show status
-            detail = await manus_request("GET", f"/tasks/{task_id}")
-            status = detail.get("status", "unknown")
-            meta = detail.get("metadata") or {}
-            title = meta.get("task_title", "")
+        if not output:
             return (
                 f"No step trace available for task {task_id}.\n"
-                f"Status: {status}\n"
-                f"Title: {title}\n"
-                f"Note: Step tracing may not be available for this task type."
+                f"Status : {status}\n"
+                f"Title  : {title}\n"
+                f"Note   : Task has no output turns yet."
             )
 
-        lines = [f"Step trace for task {task_id} ({len(steps)} steps):"]
-        total_duration = 0
-        for i, s in enumerate(steps):
-            tool = s.get("tool", s.get("type", "unknown"))
-            summary = s.get("summary", s.get("description", s.get("action", "")))[:200]
-            duration_ms = s.get("duration_ms", s.get("duration", 0))
-            try:
-                duration_s = int(duration_ms) // 1000
-            except (TypeError, ValueError):
-                duration_s = 0
-            total_duration += duration_s
-            status = s.get("status", "")
-            cost = s.get("credit_usage", s.get("credits", 0))
+        # Extract meaningful turns (skip empty assistant stubs)
+        turns = []
+        for item in output:
+            role = item.get("role", "")
+            content = item.get("content", [])
+            text = ""
+            if isinstance(content, list):
+                for c in content:
+                    if isinstance(c, dict) and c.get("type") == "output_text":
+                        text = c.get("text", "")[:300]
+                        break
+            elif isinstance(content, str):
+                text = content[:300]
+            if text:
+                turns.append((role, text))
 
-            line = f"  Step {i+1}: [{tool}] {summary} ({duration_s}s)"
-            if status and status != "completed":
-                line += f" [{status}]"
-            if cost:
-                line += f" {_usd(cost)}"
-            lines.append(line)
+        lines = [
+            f"Step trace for task {task_id} ({len(turns)} turns):",
+            f"  Title  : {title}",
+            f"  Status : {status}  |  Cost: {_usd(credits)}",
+        ]
+        if task_url:
+            lines.append(f"  URL    : {task_url}")
+        lines.append("")
 
-        lines.append(f"\nTotal: {len(steps)} steps, {total_duration}s wall-clock time")
+        for i, (role, text) in enumerate(turns):
+            prefix = "\U0001f464 User" if role == "user" else "\U0001f916 Manus"
+            lines.append(f"  [{i+1}] {prefix}: {text}")
+
+        lines.append(f"\nTotal: {len(turns)} turns, {_usd(credits)} spent")
         return "\n".join(lines)
     except Exception as e:
         return handle_api_error(e)
@@ -933,38 +938,44 @@ async def manus_get_parent(task_id: str) -> str:
         task_id: The subtask ID to resolve
     """
     try:
+        # The Manus API does not expose a parent_id field in the task object.
+        # We return the task's own metadata and note the API limitation.
         detail = await manus_request("GET", f"/tasks/{task_id}")
-        parent_id = detail.get("parent_id") or detail.get("parent_task_id")
+        meta = detail.get("metadata") or {}
+        title = meta.get("task_title", "(no title)")
+        status = detail.get("status", "unknown")
+        credits = detail.get("credit_usage", 0)
+        task_url = meta.get("task_url", "")
+        created = detail.get("created_at", "")
+        human_time = _human_time(created) if created else ""
 
-        if not parent_id:
-            meta = detail.get("metadata") or {}
-            title = meta.get("task_title", "")
-            status = detail.get("status", "unknown")
-            return (
-                f"Top-level task — no parent.\n"
-                f"task_id : {task_id}\n"
-                f"title   : {title}\n"
-                f"status  : {status}"
-            )
-
-        parent = await manus_request("GET", f"/tasks/{parent_id}")
-        parent_meta = parent.get("metadata") or {}
-        parent_title = parent_meta.get("task_title", "(no title)")
-        parent_status = parent.get("status", "unknown")
-        parent_url = parent_meta.get("task_url", "")
-        parent_created = parent.get("created_at", "")
-        parent_human = _human_time(parent_created) if parent_created else ""
+        # Detect if this looks like a subtask by title pattern
+        subtask_patterns = ["subtask", "sub-task", "wide research", "parallel", "worker"]
+        looks_like_subtask = any(p in title.lower() for p in subtask_patterns)
 
         lines = [
-            f"Subtask {task_id} is a child of:",
-            f"  parent_id : {parent_id}",
-            f"  title     : {parent_title}",
-            f"  status    : {parent_status}",
+            f"Task info for {task_id}:",
+            f"  title   : {title}",
+            f"  status  : {status}  |  cost: {_usd(credits)}",
         ]
-        if parent_human:
-            lines.append(f"  created   : {parent_human}")
-        if parent_url:
-            lines.append(f"  url       : {parent_url}")
+        if human_time:
+            lines.append(f"  created : {human_time}")
+        if task_url:
+            lines.append(f"  url     : {task_url}")
+        lines.append("")
+
+        if looks_like_subtask:
+            lines.append(
+                "\u26a0\ufe0f  This task title suggests it may be a subtask, but the Manus API "
+                "does not expose a parent_id field. To find the parent, use manus_list_tasks "
+                "and look for a task created around the same time with a broader title."
+            )
+        else:
+            lines.append(
+                "\u2139\ufe0f  The Manus API does not expose parent/child task relationships. "
+                "This appears to be a top-level task based on its title."
+            )
+
         return "\n".join(lines)
     except Exception as e:
         return handle_api_error(e)
