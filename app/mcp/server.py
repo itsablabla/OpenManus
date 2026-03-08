@@ -419,6 +419,10 @@ async def manus_create_task(
     use_gmail_connector: bool = False,
     use_notion_connector: bool = False,
     use_gcal_connector: bool = False,
+    agent_name: str = "",
+    agent_purpose: str = "",
+    agent_tags: str = "",
+    triggered_by: str = "jaden",
 ) -> str:
     """
     Submit a long-running task to Manus AI for autonomous execution.
@@ -434,6 +438,10 @@ async def manus_create_task(
         use_gmail_connector: Grant Manus access to Gmail
         use_notion_connector: Grant Manus access to Notion
         use_gcal_connector: Grant Manus access to Google Calendar
+        agent_name: Optional human-readable name for this agent (registered in agent registry)
+        agent_purpose: Optional one-sentence purpose description
+        agent_tags: Optional comma-separated tags (e.g. 'build,research,memory')
+        triggered_by: Who triggered this agent (jaden | manus | n8n | auto)
     """
     try:
         profile_map = {
@@ -504,7 +512,18 @@ async def manus_create_task(
                 logger.warning("[memory] Failed to store task context: %s", e)
 
         created_human = _human_time(created_at) if created_at else "just now"
-
+        # Register agent in registry (always — auto-generates name from prompt if not provided)
+        registry_note = ""
+        try:
+            tags_list = [t.strip() for t in agent_tags.split(",") if t.strip()] if agent_tags else []
+            _registry_add(
+                task_id=task_id, prompt=prompt, agent_name=agent_name,
+                agent_purpose=agent_purpose, triggered_by=triggered_by, tags=tags_list,
+            )
+            reg_name = agent_name or _auto_agent_name(prompt)
+            registry_note = f"\nregistered: {reg_name} (use agent_registry_list to view)"
+        except Exception as reg_err:
+            logger.warning("[registry] Failed to register agent: %s", reg_err)
         return (
             f"Task created successfully.\n"
             f"task_id : {task_id}\n"
@@ -512,9 +531,12 @@ async def manus_create_task(
             f"created : {created_human}\n"
             f"prompt  : {prompt[:120]}{'...' if len(prompt) > 120 else ''}\n"
             f"Tip     : Call manus_get_task(task_id='{task_id}') in 2-3 minutes to check progress."
+            f"{registry_note}"
         )
     except Exception as e:
-        return handle_api_error(e)
+        error_msg = str(e)
+        logger.error("[manus_create_task] Task creation failed: %s", error_msg)
+        return f"ERROR: Task creation failed.\nReason: {error_msg}\nCheck your Manus API key and prompt."
 
 
 @mcp.tool()
@@ -609,24 +631,39 @@ async def manus_get_task(task_id: str) -> str:
 
 @mcp.tool()
 async def manus_list_tasks(
-    limit: int = 20,
+    limit: int = 50,
     status_filter: str = "",
+    paginate: bool = True,
 ) -> str:
     """
     List recent Manus tasks with credit usage, timing, and prompt context.
+    Paginates automatically to reach the requested limit (max 500).
 
     Args:
-        limit: Number of tasks to return (1-100, default 20)
+        limit: Number of tasks to return (default 50, max 500)
         status_filter: Optional filter — pending | running | completed | failed
+        paginate: If True (default), fetch multiple pages to reach limit
     """
     try:
-        params: dict = {"limit": limit}
-        if status_filter:
-            params["status"] = status_filter
-
-        result = await manus_request("GET", "/tasks", params=params)
-        tasks = result.get("tasks", result.get("data", []))
-        has_more = result.get("has_more", False)
+        effective_limit = min(max(1, limit), 500)
+        tasks = []
+        page = 1
+        while len(tasks) < effective_limit:
+            batch_size = min(100, effective_limit - len(tasks))
+            params: dict = {"limit": batch_size, "page": page}
+            if status_filter:
+                params["status"] = status_filter
+            result = await manus_request("GET", "/tasks", params=params)
+            batch = result.get("tasks", result.get("data", []))
+            if not batch:
+                break
+            tasks.extend(batch)
+            has_more = result.get("has_more", False)
+            if not paginate or not has_more or len(batch) < batch_size:
+                break
+            page += 1
+            if page > 10:
+                break
 
         if not tasks:
             return "No tasks found."
@@ -1079,6 +1116,7 @@ async def manus_watch_task(
 async def manus_cost_summary(
     hours_back: int = 168,
     group_by: str = "day",
+    days_back: int = 0,
 ) -> str:
     """
     Get a cost breakdown of Manus usage over any time range.
@@ -1090,9 +1128,12 @@ async def manus_cost_summary(
     Args:
         hours_back: How many hours to look back (default 168 = 7 days)
         group_by: 'day' or 'week' (default 'day')
+        days_back: Convenience alias — if set, overrides hours_back (days_back=1 = yesterday)
     """
     try:
         from collections import defaultdict
+        if days_back > 0:
+            hours_back = days_back * 24
 
         result = await manus_request("GET", "/tasks", params={"limit": 100})
         tasks = result.get("tasks", result.get("data", []))
@@ -1197,7 +1238,7 @@ _RUNAWAY_CREDITS = _safe_int(os.environ.get("GARZA_RUNAWAY_CREDITS"), 10)
 @mcp.tool()
 async def garza_status(
     query: str = "What did Manus do today?",
-    hours: int = 24,
+    hours: int = 48,
     limit: int = 10,
 ) -> str:
     """
@@ -1919,5 +1960,865 @@ async def garza_flow_status(hours: int = 24) -> str:
             output_lines.insert(7, "")
 
         return "\n".join(output_lines)
+    except Exception as e:
+        return handle_api_error(e)
+
+
+# ===========================================================================
+# SPRINT 4 — GARZA OS Agent Fleet Scale Architecture (Parts 1-4, 6)
+# ===========================================================================
+
+import re as _re
+
+# ---------------------------------------------------------------------------
+# Part 1 — Agent Registry helpers
+# ---------------------------------------------------------------------------
+
+_REGISTRY_PATH = "/app/data/agent_registry.json"
+_KILL_LOG_PATH = "/app/data/kill_log.json"
+
+
+def _ensure_data_dir() -> None:
+    """Create /app/data directory if it doesn't exist."""
+    import os as _os
+    _os.makedirs("/app/data", exist_ok=True)
+
+
+def _registry_load() -> list:
+    """Load agent registry from disk. Returns [] if missing."""
+    _ensure_data_dir()
+    try:
+        with open(_REGISTRY_PATH) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def _registry_save(entries: list) -> None:
+    """Persist agent registry to disk."""
+    _ensure_data_dir()
+    with open(_REGISTRY_PATH, "w") as f:
+        json.dump(entries, f, indent=2)
+
+
+def _slugify(text: str) -> str:
+    """Convert text to a URL-safe slug."""
+    text = text.lower().strip()
+    text = _re.sub(r"[^\w\s-]", "", text)
+    text = _re.sub(r"[\s_-]+", "-", text)
+    return text[:64].strip("-")
+
+
+def _auto_agent_name(prompt: str) -> str:
+    """Generate an agent name from the first 6 words of a prompt."""
+    words = prompt.strip().split()[:6]
+    return _slugify(" ".join(words)) or "unnamed-agent"
+
+
+def _registry_add(task_id: str, prompt: str, agent_name: str = "", agent_purpose: str = "",
+                  triggered_by: str = "jaden", tags: list = None,
+                  expected_duration_minutes: int = 30) -> dict:
+    """Add an entry to the agent registry."""
+    entries = _registry_load()
+    name = agent_name or _auto_agent_name(prompt)
+    entry = {
+        "agent_id": name,
+        "task_id": task_id,
+        "name": agent_name or name,
+        "purpose": agent_purpose or prompt[:120],
+        "triggered_by": triggered_by,
+        "created_at": int(time.time()),
+        "tags": tags or [],
+        "expected_duration_minutes": expected_duration_minutes,
+    }
+    # Remove any existing entry for this task_id
+    entries = [e for e in entries if e.get("task_id") != task_id]
+    entries.append(entry)
+    _registry_save(entries)
+    return entry
+
+
+# ---------------------------------------------------------------------------
+# Part 1 — Tool: agent_registry_list
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def agent_registry_list() -> str:
+    """
+    List all registered agents with their current task status from the Manus API.
+    Joins the local agent registry with live task data to show name, purpose, status, and cost.
+    """
+    try:
+        entries = _registry_load()
+        if not entries:
+            return "Agent registry is empty. Use manus_create_task with agent_name to register agents."
+
+        # Fetch live status for all registered task IDs
+        lines = [
+            f"GARZA OS — Agent Registry ({len(entries)} agents)",
+            "━" * 50,
+            "",
+        ]
+        for entry in sorted(entries, key=lambda e: e.get("created_at", 0), reverse=True):
+            task_id = entry.get("task_id", "")
+            name = entry.get("name", entry.get("agent_id", "?"))
+            purpose = entry.get("purpose", "")[:80]
+            triggered_by = entry.get("triggered_by", "?")
+            tags = ", ".join(entry.get("tags", [])) or "none"
+            created_human = _human_time(entry.get("created_at", 0))
+
+            # Fetch live status
+            status = "unknown"
+            cost_str = ""
+            try:
+                task_data = await manus_request("GET", f"/tasks/{task_id}")
+                status = task_data.get("status", "unknown")
+                credits = task_data.get("credit_usage") or task_data.get("credits_used") or 0
+                try:
+                    credits_int = int(credits)
+                except (TypeError, ValueError):
+                    credits_int = 0
+                cost_str = _usd(credits_int) if credits_int else ""
+            except Exception:
+                pass
+
+            status_icon = {"completed": "✅", "running": "🟢", "failed": "🔴",
+                           "pending": "⏳", "unknown": "❓"}.get(status, "❓")
+            lines.append(f"{status_icon} {name}")
+            lines.append(f"   task_id  : {task_id}")
+            lines.append(f"   status   : {status}{' · ' + cost_str if cost_str else ''}")
+            lines.append(f"   purpose  : {purpose}")
+            lines.append(f"   by       : {triggered_by}  |  created: {created_human}")
+            lines.append(f"   tags     : {tags}")
+            lines.append(f"   url      : https://manus.im/app/{task_id}")
+            lines.append("")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return handle_api_error(e)
+
+
+# ---------------------------------------------------------------------------
+# Part 1 — Tool: agent_registry_update
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def agent_registry_update(
+    task_id: str = "",
+    agent_id: str = "",
+    name: str = "",
+    purpose: str = "",
+    tags: str = "",
+    triggered_by: str = "",
+) -> str:
+    """
+    Update name, purpose, tags, or triggered_by for a registered agent.
+    Identify the agent by task_id OR agent_id (slug).
+    Args:
+        task_id: Manus task ID of the agent to update
+        agent_id: Agent slug (alternative to task_id)
+        name: New human-readable name
+        purpose: New one-sentence purpose description
+        tags: Comma-separated tags (replaces existing tags)
+        triggered_by: Who triggered this agent (jaden | manus | n8n | auto)
+    """
+    try:
+        if not task_id and not agent_id:
+            return "Error: provide task_id or agent_id to identify the agent."
+
+        entries = _registry_load()
+        updated = False
+        for entry in entries:
+            match = (task_id and entry.get("task_id") == task_id) or \
+                    (agent_id and entry.get("agent_id") == agent_id)
+            if match:
+                if name:
+                    entry["name"] = name
+                if purpose:
+                    entry["purpose"] = purpose
+                if tags:
+                    entry["tags"] = [t.strip() for t in tags.split(",") if t.strip()]
+                if triggered_by:
+                    entry["triggered_by"] = triggered_by
+                entry["updated_at"] = int(time.time())
+                updated = True
+                break
+
+        if not updated:
+            return f"No agent found with task_id={task_id!r} or agent_id={agent_id!r}."
+
+        _registry_save(entries)
+        return f"Agent updated successfully.\ntask_id: {task_id or '(by agent_id)'}\nagent_id: {agent_id or '(by task_id)'}"
+    except Exception as e:
+        return handle_api_error(e)
+
+
+# ---------------------------------------------------------------------------
+# Part 2 — garza_fleet_status helpers
+# ---------------------------------------------------------------------------
+
+def _classify_task_state(task: dict, now_ts: float) -> str:
+    """Classify a task into one of 5 fleet states."""
+    status = task.get("status", "unknown")
+    updated_raw = task.get("updated_at") or task.get("created_at") or 0
+    try:
+        updated_ts = float(updated_raw)
+    except (TypeError, ValueError):
+        updated_ts = 0
+
+    age_secs = now_ts - updated_ts
+
+    if status == "completed":
+        return "completed"
+    if status in ("failed", "error"):
+        return "failed"
+    if status in ("running", "pending"):
+        if age_secs < 1800:  # < 30 min
+            return "active"
+        elif age_secs < 7200:  # 30 min – 2h
+            return "stalled"
+        else:  # > 2h
+            return "zombie"
+    return "completed" if status == "completed" else "unknown"
+
+
+def _is_subtask(task: dict) -> bool:
+    """Heuristic: detect Wide Research / parallel subtasks."""
+    title = (task.get("metadata") or {}).get("task_title", "")
+    if not title:
+        title = task.get("title", "")
+    lower = title.lower()
+    return any(kw in lower for kw in [
+        "subtask", "sub-task", "wide research", "parallel", "research subtask",
+        "research task", "subtask #", "sub task"
+    ])
+
+
+# ---------------------------------------------------------------------------
+# Part 2 — Tool: garza_fleet_status
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def garza_fleet_status(
+    filter: str = "all",
+) -> str:
+    """
+    Complete fleet overview across ALL agents — the single command for 100+ concurrent agent ops.
+    Fetches all tasks (paginated), classifies into 5 states, collapses subtasks, and shows cost.
+
+    States: active (running <30m), stalled (running 30m-2h), zombie (running >2h), completed, failed.
+    Subtasks (Wide Research, parallel) are collapsed under their parent task.
+
+    Args:
+        filter: all (default) | attention (zombies + stalled only) | active | completed | today
+    """
+    try:
+        now_ts = time.time()
+        registry = _registry_load()
+        registry_by_task = {e["task_id"]: e for e in registry}
+
+        # 1. Fetch ALL tasks via pagination
+        all_tasks = []
+        page = 1
+        page_size = 100
+        while True:
+            try:
+                result = await manus_request("GET", "/tasks", params={"limit": page_size, "page": page})
+            except Exception:
+                break
+            batch = result.get("tasks", result.get("data", []))
+            if not batch:
+                break
+            all_tasks.extend(batch)
+            has_more = result.get("has_more", False) or result.get("hasMore", False)
+            if not has_more or len(batch) < page_size:
+                break
+            page += 1
+            if page > 20:  # safety cap: 2000 tasks max
+                break
+
+        if not all_tasks:
+            return "No tasks found."
+
+        # 2. Classify every task
+        classified = []
+        for t in all_tasks:
+            state = _classify_task_state(t, now_ts)
+            credits = t.get("credit_usage") or t.get("credits_used") or 0
+            try:
+                credits_int = int(credits)
+            except (TypeError, ValueError):
+                credits_int = 0
+            meta = t.get("metadata") or {}
+            title = meta.get("task_title") or t.get("title") or t.get("id", "?")
+            created_raw = t.get("created_at") or 0
+            updated_raw = t.get("updated_at") or created_raw
+            try:
+                created_ts = float(created_raw)
+                updated_ts = float(updated_raw)
+            except (TypeError, ValueError):
+                created_ts = updated_ts = 0
+
+            classified.append({
+                "id": t.get("id", "?"),
+                "title": title,
+                "state": state,
+                "status": t.get("status", "?"),
+                "credits": credits_int,
+                "created_ts": created_ts,
+                "updated_ts": updated_ts,
+                "is_subtask": _is_subtask(t),
+                "registry": registry_by_task.get(t.get("id", ""), {}),
+            })
+
+        # 3. Apply filter
+        today_cutoff = now_ts - 86400
+        if filter == "attention":
+            show_states = {"zombie", "stalled"}
+        elif filter == "active":
+            show_states = {"active"}
+        elif filter == "completed":
+            show_states = {"completed"}
+        elif filter == "today":
+            classified = [c for c in classified if c["created_ts"] >= today_cutoff]
+            show_states = {"active", "stalled", "zombie", "completed", "failed", "unknown"}
+        else:
+            show_states = {"active", "stalled", "zombie", "completed", "failed", "unknown"}
+
+        visible = [c for c in classified if c["state"] in show_states]
+
+        # 4. Separate named tasks from subtasks
+        named = [c for c in visible if not c["is_subtask"]]
+        subtasks = [c for c in visible if c["is_subtask"]]
+
+        # 5. Collapse subtasks under nearest named task (±15 min window)
+        collapsed_groups: dict = {}  # named_task_id -> list of subtasks
+        orphan_subtasks = []
+        for sub in subtasks:
+            best_match = None
+            best_diff = float("inf")
+            for named_task in named:
+                diff = abs(sub["created_ts"] - named_task["created_ts"])
+                if diff < 900 and diff < best_diff:  # 15 min window
+                    best_diff = diff
+                    best_match = named_task["id"]
+            if best_match:
+                collapsed_groups.setdefault(best_match, []).append(sub)
+            else:
+                orphan_subtasks.append(sub)
+
+        # 6. Sort: zombies first, stalled, active, failed, completed
+        state_order = {"zombie": 0, "stalled": 1, "active": 2, "failed": 3, "completed": 4, "unknown": 5}
+        named.sort(key=lambda c: (state_order.get(c["state"], 5), -c["updated_ts"]))
+
+        # 7. Build output
+        total_credits = sum(c["credits"] for c in classified)
+        total_tasks = len(classified)
+        attention_count = sum(1 for c in classified if c["state"] in ("zombie", "stalled"))
+
+        # Count by state
+        state_counts = {}
+        for c in classified:
+            state_counts[c["state"]] = state_counts.get(c["state"], 0) + 1
+
+        date_str = datetime.fromtimestamp(now_ts).strftime("%B %-d, %Y")
+        lines = [
+            f"GARZA OS Fleet Status — {date_str}",
+            "━" * 50,
+            f"💰 {_usd(total_credits)} spent · {total_tasks} tasks · {attention_count} agents need attention",
+            "",
+        ]
+
+        state_icons = {
+            "zombie": "🧟 ZOMBIE",
+            "stalled": "🟡 STALLED",
+            "active": "🟢 ACTIVE",
+            "failed": "🔴 FAILED",
+            "completed": "✅ COMPLETED",
+        }
+
+        current_state = None
+        for task in named:
+            state = task["state"]
+
+            # State header
+            if state != current_state:
+                current_state = state
+                count = state_counts.get(state, 0)
+                descriptions = {
+                    "zombie": "running but silent 2h+",
+                    "stalled": "running but no update 30min–2h",
+                    "active": "running, updated recently",
+                    "failed": "errored out",
+                    "completed": "done",
+                }
+                lines.append(f"{state_icons.get(state, state.upper())} ({count}) — {descriptions.get(state, '')}")
+
+            # Task line
+            name = task["registry"].get("name") or task["title"][:55]
+            age_secs = now_ts - task["updated_ts"]
+            if age_secs < 60:
+                age_str = f"{int(age_secs)}s ago"
+            elif age_secs < 3600:
+                age_str = f"{int(age_secs/60)}m ago"
+            elif age_secs < 86400:
+                age_str = f"{int(age_secs/3600)}h {int((age_secs%3600)/60)}m ago"
+            else:
+                age_str = f"{int(age_secs/86400)}d ago"
+
+            duration_secs = task["updated_ts"] - task["created_ts"]
+            if duration_secs < 60:
+                dur_str = f"{int(duration_secs)}s"
+            elif duration_secs < 3600:
+                dur_str = f"{int(duration_secs/60)}m {int(duration_secs%60)}s"
+            else:
+                dur_str = f"{int(duration_secs/3600)}h {int((duration_secs%3600)/60)}m"
+
+            created_dt = datetime.fromtimestamp(task["created_ts"]).strftime("%b %-d") if task["created_ts"] else "?"
+            cost_str = _usd(task["credits"]) if task["credits"] else "$0.00"
+
+            kill_hint = "  → KILL" if state == "zombie" else ""
+            lines.append(f"  {name:<40}  {created_dt}  {dur_str:<8}  {cost_str:<8}  silent {age_str}{kill_hint}")
+            lines.append(f"    https://manus.im/app/{task['id']}")
+
+            # Collapsed subtasks
+            subs = collapsed_groups.get(task["id"], [])
+            if subs:
+                sub_credits = sum(s["credits"] for s in subs)
+                sub_states = set(s["state"] for s in subs)
+                sub_status = "all completed" if sub_states == {"completed"} else f"{len([s for s in subs if s['state']=='completed'])} completed"
+                lines.append(f"    ↳ {len(subs)} subtasks · {sub_status} · {_usd(sub_credits)}")
+
+            lines.append("")
+
+        # Orphan subtasks
+        if orphan_subtasks and filter in ("all", "today"):
+            lines.append(f"⚪ Ungrouped subtasks: {len(orphan_subtasks)}")
+            for s in orphan_subtasks[:3]:
+                lines.append(f"   - {s['title'][:60]}")
+            if len(orphan_subtasks) > 3:
+                lines.append(f"   ... and {len(orphan_subtasks)-3} more")
+            lines.append("")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return handle_api_error(e)
+
+
+# ---------------------------------------------------------------------------
+# Part 3 — manus_kill_task
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def manus_kill_task(
+    task_id: str,
+    reason: str = "",
+) -> str:
+    """
+    Terminate a running Manus task. Tries DELETE, then POST /cancel, then POST /stop.
+    Logs the kill to /app/data/kill_log.json and removes from agent registry.
+    Args:
+        task_id: The Manus task ID to kill
+        reason: Optional reason for killing (logged)
+    """
+    try:
+        # Get current task state before killing
+        task_data = {}
+        credits_at_kill = 0
+        duration_str = ""
+        try:
+            task_data = await manus_request("GET", f"/tasks/{task_id}")
+            credits = task_data.get("credit_usage") or task_data.get("credits_used") or 0
+            try:
+                credits_at_kill = int(credits)
+            except (TypeError, ValueError):
+                credits_at_kill = 0
+            created_raw = task_data.get("created_at") or 0
+            try:
+                created_ts = float(created_raw)
+                duration_secs = time.time() - created_ts
+                if duration_secs < 3600:
+                    duration_str = f"{int(duration_secs/60)}m"
+                else:
+                    duration_str = f"{int(duration_secs/3600)}h {int((duration_secs%3600)/60)}m"
+            except (TypeError, ValueError):
+                duration_str = "?"
+        except Exception:
+            pass
+
+        # Try three termination endpoints
+        killed = False
+        method_used = ""
+        for http_method, endpoint in [
+            ("DELETE", f"/tasks/{task_id}"),
+            ("POST", f"/tasks/{task_id}/cancel"),
+            ("POST", f"/tasks/{task_id}/stop"),
+        ]:
+            try:
+                await manus_request(http_method, endpoint)
+                killed = True
+                method_used = f"{http_method} {endpoint}"
+                break
+            except Exception:
+                continue
+
+        if not killed:
+            return (
+                f"Failed to kill task {task_id}.\n"
+                f"All three termination endpoints failed (DELETE, /cancel, /stop).\n"
+                f"The task may have already completed or the API doesn't support termination."
+            )
+
+        # Log the kill
+        _ensure_data_dir()
+        kill_entry = {
+            "task_id": task_id,
+            "reason": reason or "manual kill",
+            "cost_at_kill": _usd(credits_at_kill),
+            "credits_at_kill": credits_at_kill,
+            "killed_at": int(time.time()),
+            "method": method_used,
+            "duration": duration_str,
+        }
+        try:
+            kill_log = []
+            try:
+                with open(_KILL_LOG_PATH) as f:
+                    kill_log = json.load(f)
+            except (FileNotFoundError, json.JSONDecodeError):
+                pass
+            kill_log.append(kill_entry)
+            with open(_KILL_LOG_PATH, "w") as f:
+                json.dump(kill_log, f, indent=2)
+        except Exception as e:
+            logger.warning("[kill_log] Failed to write kill log: %s", e)
+
+        # Remove from registry
+        entries = _registry_load()
+        entries = [e for e in entries if e.get("task_id") != task_id]
+        _registry_save(entries)
+
+        return (
+            f"✅ Task killed successfully.\n"
+            f"task_id  : {task_id}\n"
+            f"method   : {method_used}\n"
+            f"cost     : {_usd(credits_at_kill)} ({credits_at_kill} credits)\n"
+            f"duration : {duration_str}\n"
+            f"reason   : {reason or 'manual kill'}"
+        )
+    except Exception as e:
+        return handle_api_error(e)
+
+
+# ---------------------------------------------------------------------------
+# Part 3 — manus_kill_zombies
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def manus_kill_zombies(
+    confirm: bool = False,
+) -> str:
+    """
+    Bulk-kill all zombie tasks (running but silent for 2h+).
+    If confirm=False (default), returns a dry-run list of what would be killed.
+    If confirm=True, kills all zombies and returns a summary.
+    Args:
+        confirm: False = dry-run (safe), True = actually kill all zombies
+    """
+    try:
+        now_ts = time.time()
+
+        # Fetch all tasks
+        all_tasks = []
+        page = 1
+        while True:
+            try:
+                result = await manus_request("GET", "/tasks", params={"limit": 100, "page": page})
+            except Exception:
+                break
+            batch = result.get("tasks", result.get("data", []))
+            if not batch:
+                break
+            all_tasks.extend(batch)
+            if not result.get("has_more", False) or len(batch) < 100:
+                break
+            page += 1
+            if page > 20:
+                break
+
+        # Find zombies
+        zombies = []
+        for t in all_tasks:
+            if _classify_task_state(t, now_ts) == "zombie":
+                credits = t.get("credit_usage") or t.get("credits_used") or 0
+                try:
+                    credits_int = int(credits)
+                except (TypeError, ValueError):
+                    credits_int = 0
+                meta = t.get("metadata") or {}
+                title = meta.get("task_title") or t.get("title") or t.get("id", "?")
+                updated_raw = t.get("updated_at") or t.get("created_at") or 0
+                try:
+                    updated_ts = float(updated_raw)
+                    silent_secs = now_ts - updated_ts
+                    silent_str = f"{int(silent_secs/3600)}h {int((silent_secs%3600)/60)}m"
+                except (TypeError, ValueError):
+                    silent_str = "?"
+                zombies.append({
+                    "id": t.get("id", "?"),
+                    "title": title,
+                    "credits": credits_int,
+                    "silent": silent_str,
+                })
+
+        if not zombies:
+            return "No zombie tasks found. Fleet is clean."
+
+        total_credits = sum(z["credits"] for z in zombies)
+
+        if not confirm:
+            lines = [
+                f"🧟 DRY RUN — {len(zombies)} zombie tasks would be killed",
+                f"💰 {_usd(total_credits)} would be recovered (credits already spent, but stops future charges)",
+                "",
+                "Tasks that would be killed:",
+            ]
+            for z in zombies:
+                lines.append(f"  {z['title'][:55]:<55}  silent {z['silent']}  {_usd(z['credits'])}")
+                lines.append(f"    https://manus.im/app/{z['id']}")
+            lines.append("")
+            lines.append("To kill all zombies, call: manus_kill_zombies(confirm=True)")
+            return "\n".join(lines)
+
+        # Actually kill them
+        killed = []
+        failed = []
+        for z in zombies:
+            result = await manus_kill_task(task_id=z["id"], reason="zombie kill — silent 2h+")
+            if "killed successfully" in result:
+                killed.append(z)
+            else:
+                failed.append(z)
+
+        lines = [
+            f"🧟 Zombie Kill Complete",
+            f"Killed: {len(killed)} tasks | Failed: {len(failed)} tasks",
+            f"Credits at kill: {_usd(sum(z['credits'] for z in killed))}",
+            "",
+        ]
+        if killed:
+            lines.append("Killed:")
+            for z in killed:
+                lines.append(f"  ✅ {z['title'][:60]}")
+        if failed:
+            lines.append("Failed to kill:")
+            for z in failed:
+                lines.append(f"  ❌ {z['title'][:60]} ({z['id']})")
+        return "\n".join(lines)
+    except Exception as e:
+        return handle_api_error(e)
+
+
+# ---------------------------------------------------------------------------
+# Part 4 — manus_triage_task (regex-first blocker pattern library)
+# ---------------------------------------------------------------------------
+
+BLOCKER_PATTERNS = {
+    "auth_railway":     [r"railway", r"401", r"unauthorized", r"no.*token"],
+    "auth_generic":     [r"api.key", r"authentication", r"permission denied", r"403"],
+    "missing_tool":     [r"no.*tool", r"tool not found", r"mcp.*unavailable"],
+    "waiting_human":    [r"want me to", r"shall i", r"would you like", r"confirm", r"proceed\?"],
+    "rate_limit":       [r"rate limit", r"too many requests", r"429", r"quota"],
+    "confusion":        [r"i'm not sure", r"unclear", r"could you clarify", r"what do you mean"],
+    "timeout":          [r"timed out", r"took too long", r"exceeded.*time"],
+    "completed_clean":  [],  # fallback if status=completed
+}
+
+_RESUME_HINTS = {
+    "auth_railway":   "Add the Railway Bearer token to the MCP server config and retry.",
+    "auth_generic":   "Check API key configuration and permissions, then retry.",
+    "missing_tool":   "Verify the required MCP tool is installed and the server is running.",
+    "waiting_human":  "Respond to Manus's question to continue the task.",
+    "rate_limit":     "Wait 60 seconds and retry — or reduce request frequency.",
+    "confusion":      "Clarify the task with more specific instructions.",
+    "timeout":        "Break the task into smaller steps or increase timeout limits.",
+    "completed_clean": "Task completed successfully — no action needed.",
+}
+
+
+@mcp.tool()
+async def manus_triage_task(task_id: str) -> str:
+    """
+    Classify a task's blocker in under 1 second using regex-first pattern matching.
+    No LLM call unless regex fails — uses last 500 chars of result text only.
+    Returns: blocker_type, confidence, last_words, resume_hint, resume_prompt.
+    Args:
+        task_id: The Manus task ID to triage
+    """
+    try:
+        t0 = time.time()
+
+        # Fetch task data
+        task_data = await manus_request("GET", f"/tasks/{task_id}")
+        status = task_data.get("status", "unknown")
+        output = task_data.get("output", [])
+
+        # Extract last result text (last 500 chars)
+        last_words = ""
+        for turn in reversed(output):
+            content = turn.get("content", [])
+            if isinstance(content, list):
+                for part in reversed(content):
+                    if isinstance(part, dict) and part.get("type") in ("text", "output_text"):
+                        txt = part.get("text", "").strip()
+                        if txt:
+                            last_words = txt[-500:]
+                            break
+            elif isinstance(content, str) and content.strip():
+                last_words = content.strip()[-500:]
+            if last_words:
+                break
+
+        # Fast regex pass
+        blocker_type = None
+        confidence = "low"
+
+        if status == "completed":
+            blocker_type = "completed_clean"
+            confidence = "high (status=completed)"
+        else:
+            lower_text = last_words.lower()
+            for btype, patterns in BLOCKER_PATTERNS.items():
+                if not patterns:
+                    continue
+                for pattern in patterns:
+                    if _re.search(pattern, lower_text):
+                        blocker_type = btype
+                        confidence = "high (regex match)"
+                        break
+                if blocker_type:
+                    break
+
+        elapsed_ms = int((time.time() - t0) * 1000)
+
+        # Gemini fallback only if regex found nothing and task is still running
+        if not blocker_type and status in ("running", "pending", "stalled"):
+            try:
+                gemini_key = os.environ.get("GEMINI_API_KEY", "")
+                if gemini_key and last_words:
+                    import requests as _req
+                    payload = {
+                        "contents": [{"role": "user", "parts": [{"text": (
+                            f"Task status: {status}\n"
+                            f"Last output: {last_words}\n\n"
+                            f"Classify the blocker type from: auth_railway, auth_generic, missing_tool, "
+                            f"waiting_human, rate_limit, confusion, timeout, or none.\n"
+                            f"Reply with ONLY the blocker type word."
+                        )}]}],
+                        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 20},
+                    }
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}"
+                    resp = _req.post(url, json=payload, timeout=8)
+                    resp.raise_for_status()
+                    raw = resp.json()
+                    llm_answer = raw["candidates"][0]["content"]["parts"][0]["text"].strip().lower()
+                    if llm_answer in BLOCKER_PATTERNS:
+                        blocker_type = llm_answer
+                        confidence = "medium (gemini fallback)"
+            except Exception:
+                pass
+
+        if not blocker_type:
+            blocker_type = "unknown"
+            confidence = "low (no pattern match)"
+
+        resume_hint = _RESUME_HINTS.get(blocker_type, "Review the task output and retry with more context.")
+
+        # Build resume prompt
+        if blocker_type == "waiting_human":
+            resume_prompt = f"Continue the task. Answer: Yes, proceed. Task ID: {task_id}"
+        elif blocker_type in ("auth_railway", "auth_generic"):
+            resume_prompt = f"Retry the task with correct authentication credentials. Task ID: {task_id}"
+        else:
+            resume_prompt = f"Resume task {task_id}. Previous attempt stopped due to {blocker_type}. {resume_hint}"
+
+        lines = [
+            f"task_id      : {task_id}",
+            f"status       : {status}",
+            f"blocker_type : {blocker_type}",
+            f"confidence   : {confidence}",
+            f"elapsed_ms   : {elapsed_ms}ms",
+            f"last_words   : {last_words[:120]!r}" if last_words else "last_words   : (no output)",
+            f"resume_hint  : {resume_hint}",
+            f"resume_prompt: {resume_prompt}",
+        ]
+        return "\n".join(lines)
+    except Exception as e:
+        return handle_api_error(e)
+
+
+# ---------------------------------------------------------------------------
+# Part 6 — garza_daily_brief
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def garza_daily_brief() -> str:
+    """
+    Generate a concise morning briefing in plain prose — designed for n8n/Rube scheduling.
+    Calls fleet status, cost summary, and memory recall, then passes to Gemini for a
+    5-sentence executive briefing ready to push to Beeper.
+    """
+    try:
+        import requests as _req
+
+        # 1. Fleet status (attention items only)
+        fleet_text = await garza_fleet_status(filter="attention")
+
+        # 2. Cost summary (yesterday)
+        cost_text = await manus_cost_summary(hours_back=24, group_by="day")
+
+        # 3. Memory recall
+        memory_text = ""
+        try:
+            memory_text = await garza_recall(query="recent decisions and insights", limit=3)
+        except Exception:
+            memory_text = "(memory unavailable)"
+
+        # 4. Gemini briefing
+        gemini_key = os.environ.get("GEMINI_API_KEY", "")
+        if not gemini_key:
+            return (
+                "GARZA OS Daily Brief (no Gemini — raw data):\n\n"
+                f"FLEET:\n{fleet_text[:500]}\n\n"
+                f"COST:\n{cost_text[:300]}\n\n"
+                f"MEMORY:\n{memory_text[:300]}"
+            )
+
+        combined = (
+            f"FLEET STATUS (attention items):\n{fleet_text[:1500]}\n\n"
+            f"YESTERDAY COST:\n{cost_text[:500]}\n\n"
+            f"RECENT MEMORY:\n{memory_text[:500]}"
+        )
+
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": (
+                f"{combined}\n\n"
+                "You are GARZA OS. Write a 5-sentence morning briefing for Jaden. "
+                "Lead with anything that needs his attention (zombie/stalled tasks). "
+                "Include yesterday's total spend and biggest task. "
+                "Note any decisions or insights from memory. "
+                "Be direct, no bullet points, no markdown."
+            )}]}],
+            "generationConfig": {"temperature": 0.3, "maxOutputTokens": 300},
+        }
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}"
+        resp = _req.post(url, json=payload, timeout=15)
+        resp.raise_for_status()
+        raw = resp.json()
+        briefing = raw["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+        date_str = datetime.fromtimestamp(time.time()).strftime("%A, %B %-d")
+        return f"GARZA OS Daily Brief — {date_str}\n\n{briefing}"
+
     except Exception as e:
         return handle_api_error(e)
