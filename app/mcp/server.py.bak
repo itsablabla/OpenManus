@@ -40,7 +40,7 @@ from app.mcp.manus_models import (
 )
 
 logger = logging.getLogger(__name__)
-mcp = FastMCP("OpenManus Hybrid MCP Server v16 — Memory Integration")
+mcp = FastMCP("OpenManus Hybrid MCP Server")
 
 # ---------------------------------------------------------------------------
 # Credit → USD conversion
@@ -74,7 +74,6 @@ _PUBLIC_PATHS = {
     "/oauth/authorize",
     "/oauth/token",
     "/",
-    "/health",
 }
 
 _TASK_LOG_PATH = "/tmp/task_log.jsonl"
@@ -420,10 +419,6 @@ async def manus_create_task(
     use_gmail_connector: bool = False,
     use_notion_connector: bool = False,
     use_gcal_connector: bool = False,
-    agent_name: str = "",
-    agent_purpose: str = "",
-    agent_tags: str = "",
-    triggered_by: str = "jaden",
 ) -> str:
     """
     Submit a long-running task to Manus AI for autonomous execution.
@@ -439,10 +434,6 @@ async def manus_create_task(
         use_gmail_connector: Grant Manus access to Gmail
         use_notion_connector: Grant Manus access to Notion
         use_gcal_connector: Grant Manus access to Google Calendar
-        agent_name: Optional human-readable name for this agent (registered in agent registry)
-        agent_purpose: Optional one-sentence purpose description
-        agent_tags: Optional comma-separated tags (e.g. 'build,research,memory')
-        triggered_by: Who triggered this agent (jaden | manus | n8n | auto)
     """
     try:
         profile_map = {
@@ -513,18 +504,7 @@ async def manus_create_task(
                 logger.warning("[memory] Failed to store task context: %s", e)
 
         created_human = _human_time(created_at) if created_at else "just now"
-        # Register agent in registry (always — auto-generates name from prompt if not provided)
-        registry_note = ""
-        try:
-            tags_list = [t.strip() for t in agent_tags.split(",") if t.strip()] if agent_tags else []
-            _registry_add(
-                task_id=task_id, prompt=prompt, agent_name=agent_name,
-                agent_purpose=agent_purpose, triggered_by=triggered_by, tags=tags_list,
-            )
-            reg_name = agent_name or _auto_agent_name(prompt)
-            registry_note = f"\nregistered: {reg_name} (use agent_registry_list to view)"
-        except Exception as reg_err:
-            logger.warning("[registry] Failed to register agent: %s", reg_err)
+
         return (
             f"Task created successfully.\n"
             f"task_id : {task_id}\n"
@@ -532,12 +512,9 @@ async def manus_create_task(
             f"created : {created_human}\n"
             f"prompt  : {prompt[:120]}{'...' if len(prompt) > 120 else ''}\n"
             f"Tip     : Call manus_get_task(task_id='{task_id}') in 2-3 minutes to check progress."
-            f"{registry_note}"
         )
     except Exception as e:
-        error_msg = str(e)
-        logger.error("[manus_create_task] Task creation failed: %s", error_msg)
-        return f"ERROR: Task creation failed.\nReason: {error_msg}\nCheck your Manus API key and prompt."
+        return handle_api_error(e)
 
 
 @mcp.tool()
@@ -632,27 +609,25 @@ async def manus_get_task(task_id: str) -> str:
 
 @mcp.tool()
 async def manus_list_tasks(
-    limit: int = 50,
+    limit: int = 20,
     status_filter: str = "",
-    paginate: bool = False,
 ) -> str:
     """
     List recent Manus tasks with credit usage, timing, and prompt context.
-    The Manus API supports limit up to 100 per request.
 
     Args:
-        limit: Number of tasks to return (default 50, max 100)
+        limit: Number of tasks to return (1-100, default 20)
         status_filter: Optional filter — pending | running | completed | failed
-        paginate: Unused (reserved for future API support)
     """
     try:
-        effective_limit = min(max(1, limit), 100)
-        tasks = []
-        params: dict = {"limit": effective_limit}
+        params: dict = {"limit": limit}
         if status_filter:
             params["status"] = status_filter
+
         result = await manus_request("GET", "/tasks", params=params)
         tasks = result.get("tasks", result.get("data", []))
+        has_more = result.get("has_more", False)
+
         if not tasks:
             return "No tasks found."
 
@@ -690,7 +665,7 @@ async def manus_list_tasks(
                 line += f"  {url}"
             lines.append(line)
 
-        if result.get("has_more", False):
+        if has_more:
             lines.append("\nMore tasks available — reduce limit or use status_filter.")
 
         return "\n".join(lines)
@@ -809,159 +784,32 @@ async def manus_create_webhook(
 # ---------------------------------------------------------------------------
 # Phase 2 — fabric-so-mcp Memory Integration
 # ---------------------------------------------------------------------------
-# The Fabric.so MCP server uses the MCP Streamable HTTP transport:
-#   POST /mcp with Mcp-Session-Id header for all requests after initialize.
-#   Responses are SSE streams: parse "data: {json}" lines.
-# ---------------------------------------------------------------------------
 
-_FABRIC_SO_URL = os.environ.get("FABRIC_SO_MCP_URL", "https://fabric-so-mcp-production.up.railway.app/mcp")
+_FABRIC_SO_URL = os.environ.get("FABRIC_SO_MCP_URL", "")
 _FABRIC_SO_API_KEY = os.environ.get("FABRIC_SO_API_KEY", "")
 
 
-class FabricClient:
-    """MCP Streamable HTTP client for the Fabric.so memory server.
-    
-    Manages the session lifecycle:
-    - Lazy initialize on first call (POST /mcp with initialize method)
-    - Reuse Mcp-Session-Id for all subsequent calls
-    - Auto-reinitialize on session expiry (401/404)
-    - Graceful degradation: returns {} on any failure
-    """
-
-    def __init__(self):
-        self._session_id: str | None = None
-        self._req_counter: int = 1
-        self._lock = asyncio.Lock()
-
-    def _next_id(self) -> int:
-        self._req_counter += 1
-        return self._req_counter
-
-    def _parse_sse(self, text: str) -> dict:
-        """Extract the first JSON object from an SSE response."""
-        for line in text.split("\n"):
-            line = line.strip()
-            if line.startswith("data:"):
-                payload = line[5:].strip()
-                if payload and payload != "[DONE]":
-                    try:
-                        return json.loads(payload)
-                    except json.JSONDecodeError:
-                        pass
+async def fabric_call(tool_name: str, params: dict) -> dict:
+    """Call a tool on the fabric-so-mcp server. Returns {} on failure (graceful degradation)."""
+    if not _FABRIC_SO_URL or not _FABRIC_SO_API_KEY:
         return {}
-
-    async def _initialize(self, client) -> bool:
-        """Perform the MCP initialize handshake. Returns True on success."""
-        try:
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(
-                _FABRIC_SO_URL,
-                json={
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "initialize",
-                    "params": {
-                        "protocolVersion": "2024-11-05",
-                        "capabilities": {},
-                        "clientInfo": {"name": "garza-os-mcp", "version": "1.0"},
-                    },
+                f"{_FABRIC_SO_URL.rstrip('/')}/tools/{tool_name}",
+                headers={
+                    "Authorization": f"Bearer {_FABRIC_SO_API_KEY}",
+                    "Content-Type": "application/json",
                 },
-                headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
+                json=params,
             )
             if resp.status_code == 200:
-                self._session_id = resp.headers.get("Mcp-Session-Id")
-                logger.info("[fabric] Initialized session: %s", self._session_id)
-                return bool(self._session_id)
-            logger.warning("[fabric] Initialize failed: %s", resp.status_code)
-        except Exception as e:
-            logger.warning("[fabric] Initialize error: %s", e)
-        return False
-
-    async def call(self, tool_name: str, arguments: dict) -> dict:
-        """Call a Fabric.so MCP tool. Returns the result dict or {} on failure."""
-        if not _FABRIC_SO_URL:
-            return {}
-        import httpx
-        async with self._lock:
-            try:
-                async with httpx.AsyncClient(timeout=15.0) as client:
-                    # Initialize session if needed
-                    if not self._session_id:
-                        if not await self._initialize(client):
-                            return {}
-
-                    req_id = self._next_id()
-                    resp = await client.post(
-                        _FABRIC_SO_URL,
-                        json={
-                            "jsonrpc": "2.0",
-                            "id": req_id,
-                            "method": "tools/call",
-                            "params": {"name": tool_name, "arguments": arguments},
-                        },
-                        headers={
-                            "Content-Type": "application/json",
-                            "Accept": "application/json, text/event-stream",
-                            "Mcp-Session-Id": self._session_id,
-                        },
-                    )
-
-                    # Session expired — reinitialize and retry once
-                    if resp.status_code in (401, 404):
-                        logger.info("[fabric] Session expired, reinitializing...")
-                        self._session_id = None
-                        if not await self._initialize(client):
-                            return {}
-                        req_id = self._next_id()
-                        resp = await client.post(
-                            _FABRIC_SO_URL,
-                            json={
-                                "jsonrpc": "2.0",
-                                "id": req_id,
-                                "method": "tools/call",
-                                "params": {"name": tool_name, "arguments": arguments},
-                            },
-                            headers={
-                                "Content-Type": "application/json",
-                                "Accept": "application/json, text/event-stream",
-                                "Mcp-Session-Id": self._session_id,
-                            },
-                        )
-
-                    if resp.status_code != 200:
-                        logger.warning("[fabric] %s returned %s", tool_name, resp.status_code)
-                        return {}
-
-                    envelope = self._parse_sse(resp.text)
-                    result = envelope.get("result", {})
-
-                    # Extract structured content if available
-                    if "structuredContent" in result:
-                        return result["structuredContent"]
-
-                    # Fall back to parsing text content as JSON
-                    content = result.get("content", [])
-                    if content and isinstance(content, list):
-                        text = content[0].get("text", "")
-                        try:
-                            return json.loads(text)
-                        except json.JSONDecodeError:
-                            return {"text": text}
-
-                    return result
-
-            except Exception as e:
-                logger.warning("[fabric] %s failed: %s", tool_name, e)
-                self._session_id = None  # Reset on error
-                return {}
-
-
-# Singleton Fabric client — shared across all tool calls
-_fabric = FabricClient()
-
-
-async def fabric_call(tool_name: str, params: dict) -> dict:
-    """Convenience wrapper around the singleton FabricClient."""
-    return await _fabric.call(tool_name, params)
+                return resp.json()
+            logger.warning("[fabric_call] %s returned %s: %s", tool_name, resp.status_code, resp.text[:200])
+    except Exception as e:
+        logger.warning("[fabric_call] %s failed: %s", tool_name, e)
+    return {}
 
 
 @mcp.tool()
@@ -1231,7 +1079,6 @@ async def manus_watch_task(
 async def manus_cost_summary(
     hours_back: int = 168,
     group_by: str = "day",
-    days_back: int = 0,
 ) -> str:
     """
     Get a cost breakdown of Manus usage over any time range.
@@ -1243,12 +1090,9 @@ async def manus_cost_summary(
     Args:
         hours_back: How many hours to look back (default 168 = 7 days)
         group_by: 'day' or 'week' (default 'day')
-        days_back: Convenience alias — if set, overrides hours_back (days_back=1 = yesterday)
     """
     try:
         from collections import defaultdict
-        if days_back > 0:
-            hours_back = days_back * 24
 
         result = await manus_request("GET", "/tasks", params={"limit": 100})
         tasks = result.get("tasks", result.get("data", []))
@@ -1353,7 +1197,7 @@ _RUNAWAY_CREDITS = _safe_int(os.environ.get("GARZA_RUNAWAY_CREDITS"), 10)
 @mcp.tool()
 async def garza_status(
     query: str = "What did Manus do today?",
-    hours: int = 48,
+    hours: int = 24,
     limit: int = 10,
 ) -> str:
     """
@@ -1611,7 +1455,7 @@ Analyze this trace and return the JSON diagnosis."""
     payload = {
         "system_instruction": {"parts": [{"text": _DIAGNOSE_SYSTEM}]},
         "contents": [{"role": "user", "parts": [{"text": user_content}]}],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 2048, "response_mime_type": "application/json"},
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 1024},
     }
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}"
     try:
@@ -1619,10 +1463,11 @@ Analyze this trace and return the JSON diagnosis."""
         resp.raise_for_status()
         raw = resp.json()
         text = raw["candidates"][0]["content"]["parts"][0]["text"].strip()
-        # Strip markdown code fences if present (regex handles edge cases)
+        # Strip markdown code fences if present
         if text.startswith("```"):
-            text = re.sub(r'^```(?:json)?\s*', '', text)
-            text = re.sub(r'\s*```$', '', text)
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
         return json.loads(text.strip())
     except Exception as exc:
         return {
@@ -1670,7 +1515,7 @@ async def manus_diagnose_task(task_id: str) -> str:
                 content = turn.get("content", [])
                 if isinstance(content, list):
                     for part in content:
-                        if isinstance(part, dict) and part.get("type") in ("text", "output_text"):
+                        if isinstance(part, dict) and part.get("type") == "text":
                             task_prompt = part.get("text", "(unknown)")[:500]
                             break
                 elif isinstance(content, str):
@@ -1686,20 +1531,16 @@ async def manus_diagnose_task(task_id: str) -> str:
                 for part in content:
                     if isinstance(part, dict):
                         ptype = part.get("type", "")
-                        # Manus API uses output_text / output_file (not bare "text")
-                        if ptype in ("text", "output_text"):
+                        if ptype == "text":
                             txt = part.get("text", "")[:300]
                             step_lines.append(f"Step {i+1} [{role}/text]: {txt}")
-                        elif ptype in ("tool_use", "output_tool_use"):
+                        elif ptype == "tool_use":
                             tname = part.get("name", "?")
                             tinput = str(part.get("input", ""))[:200]
                             step_lines.append(f"Step {i+1} [{role}/tool_use]: {tname}({tinput})")
-                        elif ptype in ("tool_result", "output_tool_result"):
+                        elif ptype == "tool_result":
                             tresult = str(part.get("content", ""))[:200]
                             step_lines.append(f"Step {i+1} [{role}/tool_result]: {tresult}")
-                        elif ptype == "output_file":
-                            fname = part.get("fileUrl", "").split("/")[-1].split("?")[0][:100]
-                            step_lines.append(f"Step {i+1} [{role}/file]: {fname}")
             elif isinstance(content, str):
                 step_lines.append(f"Step {i+1} [{role}]: {content[:300]}")
 
@@ -1854,7 +1695,7 @@ async def garza_flow_status(hours: int = 24) -> str:
         import re as _re
 
         # Fetch all tasks in the time window
-        resp = await manus_request("GET", "/tasks", params={"limit": 100})
+        resp = await manus_request("GET", "/tasks", params={"limit": 200})
         all_tasks = resp.get("data", resp) if isinstance(resp, dict) else resp
         if not isinstance(all_tasks, list):
             return "No tasks found."
@@ -1870,11 +1711,7 @@ async def garza_flow_status(hours: int = 24) -> str:
                 try:
                     created = datetime.fromisoformat(created.replace("Z", "+00:00")).timestamp()
                 except Exception:
-                    # Manus API returns numeric strings (Unix seconds), not ISO format
-                    try:
-                        created = int(created)
-                    except Exception:
-                        created = 0
+                    created = 0
             if created >= cutoff:
                 t["_created_ts"] = created
                 window_tasks.append(t)
@@ -1917,7 +1754,7 @@ async def garza_flow_status(hours: int = 24) -> str:
         orphans: list[dict] = []
 
         for task in window_tasks:
-            title = task.get("prompt", task.get("title", task.get("id", "")))[:80]
+            title = task.get("title", task.get("id", ""))
             ts = task.get("_created_ts", 0)
 
             if _is_subtask(title):
@@ -1929,7 +1766,7 @@ async def garza_flow_status(hours: int = 24) -> str:
                     anchor_ts = anchor.get("_created_ts", 0)
                     time_diff = abs(ts - anchor_ts)
                     if time_diff <= 600:  # ±10 minutes
-                        sim = _title_similarity(title, anchor.get("prompt", anchor.get("title", "")))
+                        sim = _title_similarity(title, anchor.get("title", ""))
                         # Also consider time proximity as a tiebreaker
                         proximity_bonus = max(0, (600 - time_diff) / 600) * 0.3
                         score = sim + proximity_bonus
@@ -1954,7 +1791,7 @@ async def garza_flow_status(hours: int = 24) -> str:
                     anchor_ts = flow["anchor"].get("_created_ts", 0)
                     if abs(ts - anchor_ts) <= 300:  # 5 minutes
                         # Only merge if titles are similar
-                        sim = _title_similarity(title, flow["anchor"].get("prompt", flow["anchor"].get("title", "")))
+                        sim = _title_similarity(title, flow["anchor"].get("title", ""))
                         if sim > 0.4:
                             flow["children"].append(task)
                             merged = True
@@ -2018,10 +1855,7 @@ async def garza_flow_status(hours: int = 24) -> str:
                     try:
                         upd = datetime.fromisoformat(upd.replace("Z", "+00:00")).timestamp()
                     except Exception:
-                        try:
-                            upd = int(upd)
-                        except Exception:
-                            upd = 0
+                        upd = 0
                 updated_list.append(upd)
             start_ts = min(ts_list) if ts_list else 0
             end_ts = max(updated_list) if updated_list else 0
@@ -2046,11 +1880,10 @@ async def garza_flow_status(hours: int = 24) -> str:
                 run_secs = now_ts - oldest_running.get("_created_ts", now_ts)
                 if run_secs > 1800:  # >30 min
                     bottleneck = f"⚠️ Task running {int(run_secs//60)}m — possible runaway"
-                    _atitle = anchor.get('prompt', anchor.get('title', anchor.get('id', '?')))[:50]
-                    attention_items.append(f"  {_atitle} — runaway task ({int(run_secs//60)}m)")
+                    attention_items.append(f"  {anchor.get('title','?')[:50]} — runaway task ({int(run_secs//60)}m)")
 
             anchor_id = anchor.get("id", "?")
-            anchor_title = (anchor.get("prompt") or anchor.get("title") or anchor_id)[:60]
+            anchor_title = anchor.get("title", anchor_id)[:60]
 
             status_icon = {"completed": "✅", "running": "🟡", "failed": "🔴", "mixed": "🟠", "stalled": "⚠️"}.get(flow_status, "❓")
 
@@ -2068,7 +1901,7 @@ async def garza_flow_status(hours: int = 24) -> str:
         if orphans:
             output_lines.append(f"⚪ Ungrouped subtasks: {len(orphans)}")
             for o in orphans[:5]:
-                output_lines.append(f"   - {(o.get('prompt') or o.get('title') or o.get('id','?'))[:60]}")
+                output_lines.append(f"   - {o.get('title', o.get('id','?'))[:60]}")
             if len(orphans) > 5:
                 output_lines.append(f"   ... and {len(orphans)-5} more")
             output_lines.append("")
@@ -2083,1413 +1916,5 @@ async def garza_flow_status(hours: int = 24) -> str:
             output_lines.insert(7, "")
 
         return "\n".join(output_lines)
-    except Exception as e:
-        return handle_api_error(e)
-
-
-# ===========================================================================
-# SPRINT 4 — GARZA OS Agent Fleet Scale Architecture (Parts 1-4, 6)
-# ===========================================================================
-
-import re as _re
-
-# ---------------------------------------------------------------------------
-# Part 1 — Agent Registry helpers
-# ---------------------------------------------------------------------------
-
-_REGISTRY_PATH = "/app/data/agent_registry.json"
-_KILL_LOG_PATH = "/app/data/kill_log.json"
-
-
-def _ensure_data_dir() -> None:
-    """Create /app/data directory if it doesn't exist."""
-    import os as _os
-    _os.makedirs("/app/data", exist_ok=True)
-
-
-def _registry_load() -> list:
-    """Load agent registry. Uses Dropbox if DROPBOX_API_KEY set, else local file."""
-    # Try Dropbox first (survives container restarts)
-    dbx_key = os.environ.get("DROPBOX_API_KEY", "")
-    if dbx_key:
-        try:
-            import dropbox
-            dbx = dropbox.Dropbox(dbx_key)
-            _, res = dbx.files_download("/garza-os/agent_registry.json")
-            return json.loads(res.content)
-        except Exception:
-            pass  # Fall through to local file
-    # Local file fallback
-    _ensure_data_dir()
-    try:
-        with open(_REGISTRY_PATH) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return []
-
-
-def _registry_save(entries: list) -> None:
-    """Persist agent registry. Uses Dropbox if DROPBOX_API_KEY set, also writes local file."""
-    # Always write local file
-    _ensure_data_dir()
-    try:
-        with open(_REGISTRY_PATH, "w") as f:
-            json.dump(entries, f, indent=2)
-    except Exception:
-        pass
-    # Also write to Dropbox if available (persistent across restarts)
-    dbx_key = os.environ.get("DROPBOX_API_KEY", "")
-    if dbx_key:
-        try:
-            import dropbox
-            from dropbox.files import WriteMode
-            dbx = dropbox.Dropbox(dbx_key)
-            content = json.dumps(entries, indent=2).encode("utf-8")
-            dbx.files_upload(content, "/garza-os/agent_registry.json", mode=WriteMode.overwrite)
-        except Exception:
-            pass  # Non-fatal — local file is the fallback
-
-
-def _slugify(text: str) -> str:
-    """Convert text to a URL-safe slug."""
-    text = text.lower().strip()
-    text = _re.sub(r"[^\w\s-]", "", text)
-    text = _re.sub(r"[\s_-]+", "-", text)
-    return text[:64].strip("-")
-
-
-def _auto_agent_name(prompt: str) -> str:
-    """Generate an agent name from the first 6 words of a prompt."""
-    words = prompt.strip().split()[:6]
-    return _slugify(" ".join(words)) or "unnamed-agent"
-
-
-def _registry_add(task_id: str, prompt: str, agent_name: str = "", agent_purpose: str = "",
-                  triggered_by: str = "jaden", tags: list = None,
-                  expected_duration_minutes: int = 30) -> dict:
-    """Add an entry to the agent registry."""
-    entries = _registry_load()
-    name = agent_name or _auto_agent_name(prompt)
-    entry = {
-        "agent_id": name,
-        "task_id": task_id,
-        "name": agent_name or name,
-        "purpose": agent_purpose or prompt[:120],
-        "triggered_by": triggered_by,
-        "created_at": int(time.time()),
-        "tags": tags or [],
-        "expected_duration_minutes": expected_duration_minutes,
-    }
-    # Remove any existing entry for this task_id
-    entries = [e for e in entries if e.get("task_id") != task_id]
-    entries.append(entry)
-    _registry_save(entries)
-    return entry
-
-
-# ---------------------------------------------------------------------------
-# Part 1 — Tool: agent_registry_list
-# ---------------------------------------------------------------------------
-
-@mcp.tool()
-async def agent_registry_list() -> str:
-    """
-    List all registered agents with their current task status from the Manus API.
-    Joins the local agent registry with live task data to show name, purpose, status, and cost.
-    """
-    try:
-        entries = _registry_load()
-        if not entries:
-            return "Agent registry is empty. Use manus_create_task with agent_name to register agents."
-
-        # Fetch live status for all registered task IDs
-        lines = [
-            f"GARZA OS — Agent Registry ({len(entries)} agents)",
-            "━" * 50,
-            "",
-        ]
-        for entry in sorted(entries, key=lambda e: e.get("created_at", 0), reverse=True):
-            task_id = entry.get("task_id", "")
-            name = entry.get("name", entry.get("agent_id", "?"))
-            purpose = entry.get("purpose", "")[:80]
-            triggered_by = entry.get("triggered_by", "?")
-            tags = ", ".join(entry.get("tags", [])) or "none"
-            created_human = _human_time(entry.get("created_at", 0))
-
-            # Fetch live status
-            status = "unknown"
-            cost_str = ""
-            try:
-                task_data = await manus_request("GET", f"/tasks/{task_id}")
-                status = task_data.get("status", "unknown")
-                credits = task_data.get("credit_usage") or task_data.get("credits_used") or 0
-                try:
-                    credits_int = int(credits)
-                except (TypeError, ValueError):
-                    credits_int = 0
-                cost_str = _usd(credits_int) if credits_int else ""
-            except Exception:
-                pass
-
-            status_icon = {"completed": "✅", "running": "🟢", "failed": "🔴",
-                           "pending": "⏳", "unknown": "❓"}.get(status, "❓")
-            lines.append(f"{status_icon} {name}")
-            lines.append(f"   task_id  : {task_id}")
-            lines.append(f"   status   : {status}{' · ' + cost_str if cost_str else ''}")
-            lines.append(f"   purpose  : {purpose}")
-            lines.append(f"   by       : {triggered_by}  |  created: {created_human}")
-            lines.append(f"   tags     : {tags}")
-            lines.append(f"   url      : https://manus.im/app/{task_id}")
-            lines.append("")
-
-        return "\n".join(lines)
-    except Exception as e:
-        return handle_api_error(e)
-
-
-# ---------------------------------------------------------------------------
-# Part 1 — Tool: agent_registry_update
-# ---------------------------------------------------------------------------
-
-@mcp.tool()
-async def agent_registry_update(
-    task_id: str = "",
-    agent_id: str = "",
-    name: str = "",
-    purpose: str = "",
-    tags: str = "",
-    triggered_by: str = "",
-) -> str:
-    """
-    Update name, purpose, tags, or triggered_by for a registered agent.
-    Identify the agent by task_id OR agent_id (slug).
-    Args:
-        task_id: Manus task ID of the agent to update
-        agent_id: Agent slug (alternative to task_id)
-        name: New human-readable name
-        purpose: New one-sentence purpose description
-        tags: Comma-separated tags (replaces existing tags)
-        triggered_by: Who triggered this agent (jaden | manus | n8n | auto)
-    """
-    try:
-        if not task_id and not agent_id:
-            return "Error: provide task_id or agent_id to identify the agent."
-
-        entries = _registry_load()
-        updated = False
-        for entry in entries:
-            match = (task_id and entry.get("task_id") == task_id) or \
-                    (agent_id and entry.get("agent_id") == agent_id)
-            if match:
-                if name:
-                    entry["name"] = name
-                if purpose:
-                    entry["purpose"] = purpose
-                if tags:
-                    entry["tags"] = [t.strip() for t in tags.split(",") if t.strip()]
-                if triggered_by:
-                    entry["triggered_by"] = triggered_by
-                entry["updated_at"] = int(time.time())
-                updated = True
-                break
-
-        if not updated:
-            return f"No agent found with task_id={task_id!r} or agent_id={agent_id!r}."
-
-        _registry_save(entries)
-        return f"Agent updated successfully.\ntask_id: {task_id or '(by agent_id)'}\nagent_id: {agent_id or '(by task_id)'}"
-    except Exception as e:
-        return handle_api_error(e)
-
-
-# ---------------------------------------------------------------------------
-# Part 2 — garza_fleet_status helpers
-# ---------------------------------------------------------------------------
-
-def _classify_task_state(task: dict, now_ts: float) -> str:
-    """Classify a task into one of 5 fleet states."""
-    status = task.get("status", "unknown")
-    updated_raw = task.get("updated_at") or task.get("created_at") or 0
-    try:
-        updated_ts = float(updated_raw)
-    except (TypeError, ValueError):
-        updated_ts = 0
-
-    age_secs = now_ts - updated_ts
-
-    if status == "completed":
-        return "completed"
-    if status in ("failed", "error"):
-        return "failed"
-    if status in ("running", "pending"):
-        if age_secs < 2700:  # < 45 min
-            return "active"
-        elif age_secs < 7200:  # 45 min – 2h
-            return "stalled"
-        else:  # > 2h
-            return "zombie"
-    return "completed" if status == "completed" else "unknown"
-
-
-def _is_subtask(task: dict) -> bool:
-    """Heuristic: detect Wide Research / parallel subtasks."""
-    title = (task.get("metadata") or {}).get("task_title", "")
-    if not title:
-        title = task.get("prompt") or task.get("title") or ""
-    lower = title.lower()
-    return any(kw in lower for kw in [
-        "subtask", "sub-task", "wide research", "parallel", "research subtask",
-        "research task", "subtask #", "sub task"
-    ])
-
-
-# ---------------------------------------------------------------------------
-# Part 2 — Tool: garza_fleet_status
-# ---------------------------------------------------------------------------
-
-@mcp.tool()
-async def garza_fleet_status(
-    filter: str = "all",
-) -> str:
-    """
-    Complete fleet overview across ALL agents — the single command for 100+ concurrent agent ops.
-    Fetches all tasks (paginated), classifies into 5 states, collapses subtasks, and shows cost.
-
-    States: active (running <30m), stalled (running 30m-2h), zombie (running >2h), completed, failed.
-    Subtasks (Wide Research, parallel) are collapsed under their parent task.
-
-    Args:
-        filter: all (default) | attention (zombies + stalled only) | active | completed | today
-    """
-    try:
-        now_ts = time.time()
-        registry = _registry_load()
-        registry_by_task = {e["task_id"]: e for e in registry}
-
-        # 1. Fetch tasks — Manus API only supports limit (max 100), no pagination
-        max_tasks: int = 200  # cap for performance
-        fetch_limit = min(max_tasks, 100)
-        fetch_error = None
-        all_tasks = []
-        try:
-            result = await manus_request("GET", "/tasks", params={"limit": fetch_limit})
-            all_tasks = result.get("tasks", result.get("data", []))
-        except Exception as e:
-            fetch_error = str(e)
-
-        if not all_tasks:
-            if fetch_error:
-                return f"Fleet status unavailable — API error: {fetch_error}"
-            return "No tasks found."
-
-        # 2. Classify every task
-        classified = []
-        skipped = 0
-        for t in all_tasks:
-            try:
-                state = _classify_task_state(t, now_ts)
-                credits = t.get("credit_usage") or t.get("credits_used") or 0
-                try:
-                    credits_int = int(credits)
-                except (TypeError, ValueError):
-                    credits_int = 0
-                meta = t.get("metadata") or {}
-                title = meta.get("task_title") or t.get("prompt") or t.get("title") or t.get("id", "?")
-                created_raw = t.get("created_at") or 0
-                updated_raw = t.get("updated_at") or created_raw
-                try:
-                    created_ts = float(created_raw)
-                    updated_ts = float(updated_raw)
-                except (TypeError, ValueError):
-                    created_ts = updated_ts = 0
-
-                classified.append({
-                    "id": t.get("id", "?"),
-                    "title": title,
-                    "state": state,
-                    "status": t.get("status", "?"),
-                    "credits": credits_int,
-                    "created_ts": created_ts,
-                    "updated_ts": updated_ts,
-                    "is_subtask": _is_subtask(t),
-                    "registry": registry_by_task.get(t.get("id", ""), {}),
-                })
-            except Exception:
-                skipped += 1
-                continue
-
-        # Fallback: if classification failed for all tasks, return raw dump
-        if not classified:
-            lines = [f"Fleet status — raw dump ({len(all_tasks)} tasks, classification failed)"]
-            if skipped:
-                lines.append(f"Skipped {skipped} tasks due to classification errors")
-            for t in all_tasks[:20]:
-                tid = t.get("id", "?")
-                status = t.get("status", "?")
-                meta = t.get("metadata") or {}
-                title = meta.get("task_title") or t.get("prompt", "") or t.get("title", "")[:50]
-                lines.append(f"  {tid}  [{status}]  {title}")
-            if len(all_tasks) > 20:
-                lines.append(f"  ... and {len(all_tasks)-20} more")
-            return "\n".join(lines)
-
-        # 3. Apply filter
-        today_cutoff = now_ts - 86400
-        if filter == "attention":
-            show_states = {"zombie", "stalled"}
-        elif filter == "active":
-            show_states = {"active"}
-        elif filter == "completed":
-            show_states = {"completed"}
-        elif filter == "today":
-            classified = [c for c in classified if c["created_ts"] >= today_cutoff]
-            show_states = {"active", "stalled", "zombie", "completed", "failed", "unknown"}
-        else:
-            show_states = {"active", "stalled", "zombie", "completed", "failed", "unknown"}
-
-        visible = [c for c in classified if c["state"] in show_states]
-
-        # If filter returns nothing, give a meaningful message (never empty string)
-        if not visible:
-            total_credits = sum(c["credits"] for c in classified)
-            state_counts = {}
-            for c in classified:
-                state_counts[c["state"]] = state_counts.get(c["state"], 0) + 1
-            counts_str = ", ".join(f"{v} {k}" for k, v in sorted(state_counts.items()))
-            return (
-                f"No tasks match filter '{filter}'. "
-                f"Fleet has {len(classified)} tasks total ({counts_str}). "
-                f"Total spend: {_usd(total_credits)}."
-            )
-
-        # 4. Separate named tasks from subtasks
-        named = [c for c in visible if not c["is_subtask"]]
-        subtasks = [c for c in visible if c["is_subtask"]]
-
-        # 5. Collapse subtasks under nearest named task (±15 min window)
-        collapsed_groups: dict = {}  # named_task_id -> list of subtasks
-        orphan_subtasks = []
-        for sub in subtasks:
-            best_match = None
-            best_diff = float("inf")
-            for named_task in named:
-                diff = abs(sub["created_ts"] - named_task["created_ts"])
-                if diff < 900 and diff < best_diff:  # 15 min window
-                    best_diff = diff
-                    best_match = named_task["id"]
-            if best_match:
-                collapsed_groups.setdefault(best_match, []).append(sub)
-            else:
-                orphan_subtasks.append(sub)
-
-        # 6. Sort: zombies first, stalled, active, failed, completed
-        state_order = {"zombie": 0, "stalled": 1, "active": 2, "failed": 3, "completed": 4, "unknown": 5}
-        named.sort(key=lambda c: (state_order.get(c["state"], 5), -c["updated_ts"]))
-
-        # 7. Build output
-        total_credits = sum(c["credits"] for c in classified)
-        total_tasks = len(classified)
-        attention_count = sum(1 for c in classified if c["state"] in ("zombie", "stalled"))
-
-        # Count by state
-        state_counts = {}
-        for c in classified:
-            state_counts[c["state"]] = state_counts.get(c["state"], 0) + 1
-
-        date_str = datetime.fromtimestamp(now_ts).strftime("%B %-d, %Y")
-        lines = [
-            f"GARZA OS Fleet Status — {date_str}",
-            "━" * 50,
-            f"💰 {_usd(total_credits)} spent · {total_tasks} tasks · {attention_count} agents need attention",
-            "",
-        ]
-
-        state_icons = {
-            "zombie": "🧟 ZOMBIE",
-            "stalled": "🟡 STALLED",
-            "active": "🟢 ACTIVE",
-            "failed": "🔴 FAILED",
-            "completed": "✅ COMPLETED",
-        }
-
-        current_state = None
-        for task in named:
-            state = task["state"]
-
-            # State header
-            if state != current_state:
-                current_state = state
-                count = state_counts.get(state, 0)
-                descriptions = {
-                    "zombie": "running but silent 2h+",
-                    "stalled": "running but no update 30min–2h",
-                    "active": "running, updated recently",
-                    "failed": "errored out",
-                    "completed": "done",
-                }
-                lines.append(f"{state_icons.get(state, state.upper())} ({count}) — {descriptions.get(state, '')}")
-
-            # Task line
-            name = task["registry"].get("name") or task.get("prompt","")[:55] or task.get("title","")[:55]
-            age_secs = now_ts - task["updated_ts"]
-            if age_secs < 60:
-                age_str = f"{int(age_secs)}s ago"
-            elif age_secs < 3600:
-                age_str = f"{int(age_secs/60)}m ago"
-            elif age_secs < 86400:
-                age_str = f"{int(age_secs/3600)}h {int((age_secs%3600)/60)}m ago"
-            else:
-                age_str = f"{int(age_secs/86400)}d ago"
-
-            duration_secs = task["updated_ts"] - task["created_ts"]
-            if duration_secs < 60:
-                dur_str = f"{int(duration_secs)}s"
-            elif duration_secs < 3600:
-                dur_str = f"{int(duration_secs/60)}m {int(duration_secs%60)}s"
-            else:
-                dur_str = f"{int(duration_secs/3600)}h {int((duration_secs%3600)/60)}m"
-
-            created_dt = datetime.fromtimestamp(task["created_ts"]).strftime("%b %-d") if task["created_ts"] else "?"
-            cost_str = _usd(task["credits"]) if task["credits"] else "$0.00"
-
-            kill_hint = "  → KILL" if state == "zombie" else ""
-            lines.append(f"  {name:<40}  {created_dt}  {dur_str:<8}  {cost_str:<8}  silent {age_str}{kill_hint}")
-            lines.append(f"    https://manus.im/app/{task['id']}")
-
-            # Collapsed subtasks
-            subs = collapsed_groups.get(task["id"], [])
-            if subs:
-                sub_credits = sum(s["credits"] for s in subs)
-                sub_states = set(s["state"] for s in subs)
-                sub_status = "all completed" if sub_states == {"completed"} else f"{len([s for s in subs if s['state']=='completed'])} completed"
-                lines.append(f"    ↳ {len(subs)} subtasks · {sub_status} · {_usd(sub_credits)}")
-
-            lines.append("")
-
-        # Orphan subtasks
-        if orphan_subtasks and filter in ("all", "today"):
-            lines.append(f"⚪ Ungrouped subtasks: {len(orphan_subtasks)}")
-            for s in orphan_subtasks[:3]:
-                lines.append(f"   - {s['title'][:60]}")
-            if len(orphan_subtasks) > 3:
-                lines.append(f"   ... and {len(orphan_subtasks)-3} more")
-            lines.append("")
-
-        return "\n".join(lines)
-    except Exception as e:
-        return handle_api_error(e)
-
-
-# ---------------------------------------------------------------------------
-# Part 3 — manus_kill_task
-# ---------------------------------------------------------------------------
-
-@mcp.tool()
-async def manus_kill_task(
-    task_id: str,
-    reason: str = "",
-) -> str:
-    """
-    Terminate a running Manus task. Tries DELETE, then POST /cancel, then POST /stop.
-    Logs the kill to /app/data/kill_log.json and removes from agent registry.
-    Args:
-        task_id: The Manus task ID to kill
-        reason: Optional reason for killing (logged)
-    """
-    try:
-        # Get current task state before killing
-        task_data = {}
-        credits_at_kill = 0
-        duration_str = ""
-        try:
-            task_data = await manus_request("GET", f"/tasks/{task_id}")
-            credits = task_data.get("credit_usage") or task_data.get("credits_used") or 0
-            try:
-                credits_at_kill = int(credits)
-            except (TypeError, ValueError):
-                credits_at_kill = 0
-            created_raw = task_data.get("created_at") or 0
-            try:
-                created_ts = float(created_raw)
-                duration_secs = time.time() - created_ts
-                if duration_secs < 3600:
-                    duration_str = f"{int(duration_secs/60)}m"
-                else:
-                    duration_str = f"{int(duration_secs/3600)}h {int((duration_secs%3600)/60)}m"
-            except (TypeError, ValueError):
-                duration_str = "?"
-        except Exception:
-            pass
-
-        # Try three termination endpoints
-        killed = False
-        method_used = ""
-        for http_method, endpoint in [
-            ("DELETE", f"/tasks/{task_id}"),
-            ("POST", f"/tasks/{task_id}/cancel"),
-            ("POST", f"/tasks/{task_id}/stop"),
-        ]:
-            try:
-                await manus_request(http_method, endpoint)
-                killed = True
-                method_used = f"{http_method} {endpoint}"
-                break
-            except Exception:
-                continue
-
-        if not killed:
-            return (
-                f"Failed to kill task {task_id}.\n"
-                f"All three termination endpoints failed (DELETE, /cancel, /stop).\n"
-                f"The task may have already completed or the API doesn't support termination."
-            )
-
-        # Log the kill
-        _ensure_data_dir()
-        kill_entry = {
-            "task_id": task_id,
-            "reason": reason or "manual kill",
-            "cost_at_kill": _usd(credits_at_kill),
-            "credits_at_kill": credits_at_kill,
-            "killed_at": int(time.time()),
-            "method": method_used,
-            "duration": duration_str,
-        }
-        try:
-            kill_log = []
-            try:
-                with open(_KILL_LOG_PATH) as f:
-                    kill_log = json.load(f)
-            except (FileNotFoundError, json.JSONDecodeError):
-                pass
-            kill_log.append(kill_entry)
-            with open(_KILL_LOG_PATH, "w") as f:
-                json.dump(kill_log, f, indent=2)
-        except Exception as e:
-            logger.warning("[kill_log] Failed to write kill log: %s", e)
-
-        # Remove from registry
-        entries = _registry_load()
-        entries = [e for e in entries if e.get("task_id") != task_id]
-        _registry_save(entries)
-
-        return (
-            f"✅ Task killed successfully.\n"
-            f"task_id  : {task_id}\n"
-            f"method   : {method_used}\n"
-            f"cost     : {_usd(credits_at_kill)} ({credits_at_kill} credits)\n"
-            f"duration : {duration_str}\n"
-            f"reason   : {reason or 'manual kill'}"
-        )
-    except Exception as e:
-        return handle_api_error(e)
-
-
-# ---------------------------------------------------------------------------
-# Part 3 — manus_kill_zombies
-# ---------------------------------------------------------------------------
-
-@mcp.tool()
-async def manus_kill_zombies(
-    confirm: bool = False,
-) -> str:
-    """
-    Bulk-kill all zombie tasks (running but silent for 2h+).
-    If confirm=False (default), returns a dry-run list of what would be killed.
-    If confirm=True, kills all zombies and returns a summary.
-    Args:
-        confirm: False = dry-run (safe), True = actually kill all zombies
-    """
-    try:
-        now_ts = time.time()
-
-        # Fetch all tasks (Manus API max limit=100, no pagination)
-        all_tasks = []
-        try:
-            result = await manus_request("GET", "/tasks", params={"limit": 100})
-            all_tasks = result.get("data", result.get("tasks", []))
-            if not isinstance(all_tasks, list):
-                all_tasks = []
-        except Exception as e:
-            return f"Failed to fetch tasks: {e}"
-
-        # Find zombies
-        zombies = []
-        for t in all_tasks:
-            if _classify_task_state(t, now_ts) == "zombie":
-                credits = t.get("credit_usage") or t.get("credits_used") or 0
-                try:
-                    credits_int = int(credits)
-                except (TypeError, ValueError):
-                    credits_int = 0
-                meta = t.get("metadata") or {}
-                title = meta.get("task_title") or t.get("prompt") or t.get("title") or t.get("id", "?")
-                updated_raw = t.get("updated_at") or t.get("created_at") or 0
-                try:
-                    updated_ts = float(updated_raw)
-                    silent_secs = now_ts - updated_ts
-                    silent_str = f"{int(silent_secs/3600)}h {int((silent_secs%3600)/60)}m"
-                except (TypeError, ValueError):
-                    silent_str = "?"
-                zombies.append({
-                    "id": t.get("id", "?"),
-                    "title": title,
-                    "credits": credits_int,
-                    "silent": silent_str,
-                })
-
-        if not zombies:
-            return "No zombie tasks found. Fleet is clean."
-
-        total_credits = sum(z["credits"] for z in zombies)
-
-        if not confirm:
-            lines = [
-                f"🧟 DRY RUN — {len(zombies)} zombie tasks would be killed",
-                f"💰 {_usd(total_credits)} would be recovered (credits already spent, but stops future charges)",
-                "",
-                "Tasks that would be killed:",
-            ]
-            for z in zombies:
-                lines.append(f"  {z['title'][:55]:<55}  silent {z['silent']}  {_usd(z['credits'])}")
-                lines.append(f"    https://manus.im/app/{z['id']}")
-            lines.append("")
-            lines.append("To kill all zombies, call: manus_kill_zombies(confirm=True)")
-            return "\n".join(lines)
-
-        # Actually kill them
-        killed = []
-        failed = []
-        for z in zombies:
-            result = await manus_kill_task(task_id=z["id"], reason="zombie kill — silent 2h+")
-            if "killed successfully" in result:
-                killed.append(z)
-            else:
-                failed.append(z)
-
-        lines = [
-            f"🧟 Zombie Kill Complete",
-            f"Killed: {len(killed)} tasks | Failed: {len(failed)} tasks",
-            f"Credits at kill: {_usd(sum(z['credits'] for z in killed))}",
-            "",
-        ]
-        if killed:
-            lines.append("Killed:")
-            for z in killed:
-                lines.append(f"  ✅ {z['title'][:60]}")
-        if failed:
-            lines.append("Failed to kill:")
-            for z in failed:
-                lines.append(f"  ❌ {z['title'][:60]} ({z['id']})")
-
-        # Wire memory: log zombie kill event
-        if killed:
-            titles = ", ".join(z['title'][:40] for z in killed[:3])
-            asyncio.ensure_future(fabric_call("agent_remember_insight", {
-                "content": f"Killed {len(killed)} zombie tasks: {titles}. Total credits recovered: {_usd(sum(z['credits'] for z in killed))}.",
-                "importance": 0.7,
-                "tags": ["zombie-kill", "fleet-ops", "manus-task"],
-            }))
-
-        return "\n".join(lines)
-    except Exception as e:
-        return handle_api_error(e)
-
-
-# ---------------------------------------------------------------------------
-# Part 4 — manus_triage_task (regex-first blocker pattern library)
-# ---------------------------------------------------------------------------
-
-BLOCKER_PATTERNS = {
-    "auth_railway":     [r"railway", r"401", r"unauthorized", r"no.*token"],
-    "auth_generic":     [r"api.key", r"authentication", r"permission denied", r"403"],
-    "missing_tool":     [r"no.*tool", r"tool not found", r"mcp.*unavailable"],
-    "waiting_human":    [r"want me to", r"shall i", r"would you like", r"confirm", r"proceed\?",
-                         r"what.*ip", r"what.*subnet", r"what.*range", r"what.*address",
-                         r"please provide", r"please share", r"please specify",
-                         r"need.*from you", r"waiting.*input", r"waiting.*response",
-                         r"could you.*provide", r"can you.*provide", r"can you.*share",
-                         r"let me know", r"what.*credentials", r"what.*password",
-                         r"what.*token", r"what.*key"],
-    "rate_limit":       [r"rate limit", r"too many requests", r"429", r"quota"],
-    "confusion":        [r"i'm not sure", r"unclear", r"could you clarify", r"what do you mean"],
-    "timeout":          [r"timed out", r"took too long", r"exceeded.*time"],
-    "network_error":    [r"connection refused", r"connection reset", r"name.*not resolve",
-                         r"network.*unreachable", r"ssl.*error", r"certificate", r"econnrefused"],
-    "file_not_found":   [r"no such file", r"file not found", r"path.*not exist", r"enoent",
-                         r"cannot open", r"failed to read"],
-    "tool_error":       [r"tool.*failed", r"mcp.*error", r"server.*error", r"500", r"internal error"],
-    "completed_clean":  [],  # fallback if status=completed
-}
-
-_RESUME_HINTS = {
-    "auth_railway":   "Add the Railway Bearer token to the MCP server config and retry.",
-    "auth_generic":   "Check API key configuration and permissions, then retry.",
-    "missing_tool":   "Verify the required MCP tool is installed and the server is running.",
-    "waiting_human":  "Respond to Manus's question to continue the task.",
-    "rate_limit":     "Wait 60 seconds and retry — or reduce request frequency.",
-    "confusion":      "Clarify the task with more specific instructions.",
-    "timeout":        "Break the task into smaller steps or increase timeout limits.",
-    "network_error":   "Check network connectivity and target service availability, then retry.",
-    "file_not_found":  "Verify the file path exists and the task has correct working directory context.",
-    "tool_error":      "Check MCP server logs for the failing tool and restart if needed.",
-    "completed_clean": "Task completed successfully — no action needed.",
-}
-
-
-@mcp.tool()
-async def manus_triage_task(task_id: str) -> str:
-    """
-    Classify a task's blocker in under 1 second using regex-first pattern matching.
-    No LLM call unless regex fails — uses last 500 chars of result text only.
-    Returns: blocker_type, confidence, last_words, resume_hint, resume_prompt.
-    Args:
-        task_id: The Manus task ID to triage
-    """
-    try:
-        t0 = time.time()
-
-        # Fetch task data
-        task_data = await manus_request("GET", f"/tasks/{task_id}")
-        status = task_data.get("status", "unknown")
-        output = task_data.get("output", [])
-
-        # Extract last result text (last 500 chars)
-        last_words = ""
-        for turn in reversed(output):
-            content = turn.get("content", [])
-            if isinstance(content, list):
-                for part in reversed(content):
-                    if isinstance(part, dict) and part.get("type") in ("text", "output_text"):
-                        txt = part.get("text", "").strip()
-                        if txt:
-                            last_words = txt[-500:]
-                            break
-            elif isinstance(content, str) and content.strip():
-                last_words = content.strip()[-500:]
-            if last_words:
-                break
-
-        # Fast regex pass
-        blocker_type = None
-        confidence = "low"
-
-        if status == "completed":
-            blocker_type = "completed_clean"
-            confidence = "high (status=completed)"
-        else:
-            lower_text = last_words.lower()
-            for btype, patterns in BLOCKER_PATTERNS.items():
-                if not patterns:
-                    continue
-                for pattern in patterns:
-                    if _re.search(pattern, lower_text):
-                        blocker_type = btype
-                        confidence = "high (regex match)"
-                        break
-                if blocker_type:
-                    break
-
-        elapsed_ms = int((time.time() - t0) * 1000)
-
-        # Gemini fallback only if regex found nothing and task is still running
-        if not blocker_type and status in ("running", "pending", "stalled"):
-            try:
-                gemini_key = os.environ.get("GEMINI_API_KEY", "")
-                if gemini_key and last_words:
-                    import requests as _req
-                    payload = {
-                        "contents": [{"role": "user", "parts": [{"text": (
-                            f"Task status: {status}\n"
-                            f"Last output: {last_words}\n\n"
-                            f"Classify the blocker type from: auth_railway, auth_generic, missing_tool, "
-                            f"waiting_human, rate_limit, confusion, timeout, or none.\n"
-                            f"Reply with ONLY the blocker type word."
-                        )}]}],
-                        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 20},
-                    }
-                    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}"
-                    resp = _req.post(url, json=payload, timeout=8)
-                    resp.raise_for_status()
-                    raw = resp.json()
-                    llm_answer = raw["candidates"][0]["content"]["parts"][0]["text"].strip().lower()
-                    if llm_answer in BLOCKER_PATTERNS:
-                        blocker_type = llm_answer
-                        confidence = "medium (gemini fallback)"
-            except Exception:
-                pass
-
-        if not blocker_type:
-            blocker_type = "unknown"
-            confidence = "low (no pattern match)"
-
-        resume_hint = _RESUME_HINTS.get(blocker_type, "Review the task output and retry with more context.")
-
-        # Wire memory: save triage insight for non-trivial blockers
-        if blocker_type not in ("completed_clean", "unknown") and last_words:
-            asyncio.ensure_future(fabric_call("agent_remember_insight", {
-                "content": f"Triage: task {task_id} blocked by {blocker_type}. Last words: {last_words[:200]}",
-                "importance": 0.6,
-                "tags": ["triage", blocker_type, "manus-task"],
-            }))
-
-        # Build resume prompt
-        if blocker_type == "waiting_human":
-            resume_prompt = f"Continue the task. Answer: Yes, proceed. Task ID: {task_id}"
-        elif blocker_type in ("auth_railway", "auth_generic"):
-            resume_prompt = f"Retry the task with correct authentication credentials. Task ID: {task_id}"
-        else:
-            resume_prompt = f"Resume task {task_id}. Previous attempt stopped due to {blocker_type}. {resume_hint}"
-
-        lines = [
-            f"task_id      : {task_id}",
-            f"status       : {status}",
-            f"blocker_type : {blocker_type}",
-            f"confidence   : {confidence}",
-            f"elapsed_ms   : {elapsed_ms}ms",
-            f"last_words   : {last_words[:120]!r}" if last_words else "last_words   : (no output)",
-            f"resume_hint  : {resume_hint}",
-            f"resume_prompt: {resume_prompt}",
-        ]
-        return "\n".join(lines)
-    except Exception as e:
-        return handle_api_error(e)
-
-
-# ---------------------------------------------------------------------------
-# Part 6 — garza_daily_brief
-# ---------------------------------------------------------------------------
-
-@mcp.tool()
-async def garza_daily_brief() -> str:
-    """
-    Generate a concise morning briefing in plain prose — designed for n8n/Rube scheduling.
-    Calls fleet status, cost summary, and memory recall, then passes to Gemini for a
-    5-sentence executive briefing ready to push to Beeper.
-    """
-    try:
-        import requests as _req
-
-        # 1. Fleet status (attention items only) — 10s timeout
-        try:
-            fleet_text = await asyncio.wait_for(garza_fleet_status(filter="attention"), timeout=10)
-        except asyncio.TimeoutError:
-            fleet_text = "(fleet status timed out)"
-
-        # 2. Cost summary (yesterday) — 8s timeout
-        try:
-            cost_text = await asyncio.wait_for(manus_cost_summary(hours_back=24, group_by="day"), timeout=8)
-        except asyncio.TimeoutError:
-            cost_text = "(cost summary timed out)"
-
-        # 3. Memory recall — 5s timeout
-        memory_text = ""
-        try:
-            memory_text = await asyncio.wait_for(
-                garza_recall(query="recent decisions and insights", limit=3), timeout=5
-            )
-        except (asyncio.TimeoutError, Exception):
-            memory_text = "(memory unavailable)"
-
-        # 4. Gemini briefing
-        gemini_key = os.environ.get("GEMINI_API_KEY", "")
-        if not gemini_key:
-            return (
-                "GARZA OS Daily Brief (no Gemini — raw data):\n\n"
-                f"FLEET:\n{fleet_text[:500]}\n\n"
-                f"COST:\n{cost_text[:300]}\n\n"
-                f"MEMORY:\n{memory_text[:300]}"
-            )
-
-        combined = (
-            f"FLEET STATUS (attention items):\n{fleet_text[:1500]}\n\n"
-            f"YESTERDAY COST:\n{cost_text[:500]}\n\n"
-            f"RECENT MEMORY:\n{memory_text[:500]}"
-        )
-
-        payload = {
-            "contents": [{"role": "user", "parts": [{"text": (
-                f"{combined}\n\n"
-                "You are GARZA OS, Jaden Garza's AI operating system. Write a 5-sentence morning briefing. "
-                "Sentence 1: Lead with the most urgent item — zombie/stalled tasks that need killing or intervention. "
-                "Sentence 2: State yesterday's total spend and name the single most expensive task. "
-                "Sentence 3: Call out any active tasks worth monitoring right now. "
-                "Sentence 4: Surface any relevant memory or context from recent decisions. "
-                "Sentence 5: One concrete action Jaden should take in the next hour. "
-                "Be direct, specific, no bullet points, no markdown, no greetings."
-            )}]}],
-            "generationConfig": {"temperature": 0.3, "maxOutputTokens": 300},
-        }
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}"
-        resp = _req.post(url, json=payload, timeout=10)
-        resp.raise_for_status()
-        raw = resp.json()
-        briefing = raw["candidates"][0]["content"]["parts"][0]["text"].strip()
-
-        date_str = datetime.fromtimestamp(time.time()).strftime("%A, %B %-d")
-        result = f"GARZA OS Daily Brief — {date_str}\n\n{briefing}"
-
-        # Wire memory: save today's brief as context
-        asyncio.ensure_future(fabric_call("agent_remember_context", {
-            "content": f"Daily brief {date_str}: {briefing[:300]}",
-            "importance": 0.5,
-            "tags": ["daily-brief", "garza-os", date_str.lower().replace(" ", "-")],
-        }))
-
-        return result
-
-    except Exception as e:
-        return handle_api_error(e)
-
-
-# ---------------------------------------------------------------------------
-# Sprint 5 — Memory-Native Tools (Phase 4 + 5)
-# ---------------------------------------------------------------------------
-
-
-@mcp.tool()
-async def garza_remember(
-    content: str,
-    memory_type: str = "Insight",
-    importance: float = 0.7,
-    tags: str = "",
-) -> str:
-    """
-    Store a memory in GARZA OS long-term memory (Fabric.so).
-
-    Use this to save:
-      - Decisions made about architecture, vendors, or strategy
-      - Insights discovered during a task (API quirks, bug patterns)
-      - Preferences Jaden expresses (format, tone, tool choices)
-      - Context that should persist across sessions
-
-    Args:
-        content: The memory content to store (be specific and complete)
-        memory_type: One of: Decision, Pattern, Preference, Style, Habit, Insight, Context
-        importance: 0.0-1.0 (0.9+ for critical, 0.7 for important, 0.5 for useful)
-        tags: Comma-separated tags e.g. "openmanus,railway,deployment"
-    """
-    valid_types = ("Decision", "Pattern", "Preference", "Style", "Habit", "Insight", "Context")
-    if memory_type not in valid_types:
-        memory_type = "Insight"
-
-    tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else ["garza-os"]
-    if "garza-os" not in tag_list:
-        tag_list.append("garza-os")
-
-    tool_map = {
-        "Decision": "agent_remember_decision",
-        "Preference": "agent_remember_preference",
-        "Insight": "agent_remember_insight",
-        "Context": "agent_remember_context",
-        "Pattern": "agent_remember_insight",   # closest match
-        "Style": "agent_remember_preference",  # closest match
-        "Habit": "agent_remember_preference",  # closest match
-    }
-    tool_name = tool_map.get(memory_type, "agent_remember_insight")
-
-    result = await fabric_call(tool_name, {
-        "content": content,
-        "importance": importance,
-        "tags": tag_list,
-    })
-
-    if result.get("error") or (isinstance(result, dict) and not result):
-        return f"Memory storage failed. Content was: {content[:100]}..."
-
-    mem_id = result.get("memory_id", result.get("id", "stored"))
-    return (
-        f"✅ Memory stored [{memory_type}] (id: {mem_id})\n"
-        f"   Content: {content[:120]}\n"
-        f"   Tags: {', '.join(tag_list)} | Importance: {importance}"
-    )
-
-
-@mcp.tool()
-async def garza_learn(query: str, limit: int = 10) -> str:
-    """
-    Recall memories AND return a system-prompt-ready injection block for the agent.
-
-    This is the 'start of session' tool — call it before any complex task to load
-    relevant context from all past sessions. Returns structured memory context
-    that can be prepended to any agent's system prompt.
-
-    Args:
-        query: What context to load (e.g. 'OpenManus MCP deployment', 'Jaden preferences')
-        limit: Max memories to load (default 10)
-    """
-    result = await fabric_call("agent_recall", {"query": query, "limit": limit, "agent_id": "garza-os"})
-
-    memories = result.get("memories", [])
-    injection = result.get("system_prompt_injection", "")
-    count = result.get("count", len(memories))
-
-    if not memories:
-        return (
-            f"No memories found for: '{query}'\n"
-            "This is a fresh context — no prior knowledge loaded.\n"
-            "Use garza_remember() to start building memory."
-        )
-
-    lines = [
-        f"Loaded {count} memories for: '{query}'",
-        "",
-        "=== MEMORY CONTEXT ===",
-    ]
-
-    for i, mem in enumerate(memories, 1):
-        mem_type = mem.get("memory_type", mem.get("type", "unknown"))
-        text = mem.get("content", mem.get("text", ""))
-        importance = mem.get("importance", 0)
-        created = mem.get("created_at", "")
-        age = _human_time(created) if created else ""
-
-        lines.append(f"{i}. [{mem_type.upper()}] {text[:200]}")
-        if importance or age:
-            meta = []
-            if importance:
-                meta.append(f"importance={importance:.1f}")
-            if age:
-                meta.append(age)
-            lines.append(f"   ({', '.join(meta)})")
-
-    if injection:
-        lines.extend(["", "=== SYSTEM PROMPT INJECTION ===", injection])
-
-    return "\n".join(lines)
-
-
-@mcp.tool()
-async def garza_preferences(category: str = "all") -> str:
-    """
-    Recall Jaden's stored preferences and working style from long-term memory.
-
-    Use before generating reports, briefs, or any output where format matters.
-    Returns all known preferences for the given category.
-
-    Args:
-        category: Filter by category — 'all', 'format', 'communication', 'tools',
-                  'briefing', 'code', or any custom tag
-    """
-    query = f"Jaden preferences {category}" if category != "all" else "Jaden preferences style format communication"
-    result = await fabric_call("agent_recall", {
-        "query": query,
-        "limit": 15,
-        "agent_id": "garza-os",
-        "memory_types": ["Preference", "Style", "Habit"],
-    })
-
-    memories = result.get("memories", [])
-
-    if not memories:
-        return (
-            "No preferences stored yet.\n"
-            "Use garza_remember(memory_type='Preference') to store preferences as you learn them."
-        )
-
-    lines = [f"Jaden's Stored Preferences ({category})", "=" * 40]
-    for mem in memories:
-        text = mem.get("content", mem.get("text", ""))
-        tags = mem.get("tags", [])
-        tag_str = f" [{', '.join(tags[:3])}]" if tags else ""
-        lines.append(f"• {text[:200]}{tag_str}")
-
-    return "\n".join(lines)
-
-
-@mcp.tool()
-async def garza_session_end(
-    session_summary: str,
-    key_decisions: str = "",
-    insights_learned: str = "",
-    preferences_noted: str = "",
-) -> str:
-    """
-    Consolidate the current session into long-term memory.
-
-    Call this at the END of every significant task or work session.
-    Stores the session summary, decisions, insights, and preferences
-    as permanent memories that will be recalled in future sessions.
-
-    Args:
-        session_summary: 2-3 sentence summary of what was accomplished
-        key_decisions: Pipe-separated list of decisions made e.g. "Used SSE transport|Removed page param"
-        insights_learned: Pipe-separated list of technical insights e.g. "Manus API uses prompt not title"
-        preferences_noted: Pipe-separated list of preferences observed e.g. "Jaden prefers concise output"
-    """
-    stored = []
-    errors = []
-
-    # Store session summary as Context
-    r = await fabric_call("agent_remember_context", {
-        "content": f"Session: {session_summary}",
-        "importance": 0.6,
-        "tags": ["session-end", "garza-os", "summary"],
-    })
-    if r:
-        stored.append(f"Summary: {session_summary[:60]}...")
-    else:
-        errors.append("summary")
-
-    # Store each decision
-    if key_decisions:
-        for decision in key_decisions.split("|"):
-            decision = decision.strip()
-            if decision:
-                r = await fabric_call("agent_remember_decision", {
-                    "content": decision,
-                    "importance": 0.8,
-                    "tags": ["decision", "garza-os"],
-                })
-                if r:
-                    stored.append(f"Decision: {decision[:60]}")
-                else:
-                    errors.append(f"decision: {decision[:40]}")
-
-    # Store each insight
-    if insights_learned:
-        for insight in insights_learned.split("|"):
-            insight = insight.strip()
-            if insight:
-                r = await fabric_call("agent_remember_insight", {
-                    "content": insight,
-                    "importance": 0.75,
-                    "tags": ["insight", "garza-os"],
-                })
-                if r:
-                    stored.append(f"Insight: {insight[:60]}")
-                else:
-                    errors.append(f"insight: {insight[:40]}")
-
-    # Store each preference
-    if preferences_noted:
-        for pref in preferences_noted.split("|"):
-            pref = pref.strip()
-            if pref:
-                r = await fabric_call("agent_remember_preference", {
-                    "content": pref,
-                    "importance": 0.7,
-                    "tags": ["preference", "jaden", "garza-os"],
-                })
-                if r:
-                    stored.append(f"Preference: {pref[:60]}")
-                else:
-                    errors.append(f"preference: {pref[:40]}")
-
-    lines = [
-        f"✅ Session consolidated — {len(stored)} memories stored",
-        "",
-    ]
-    for item in stored:
-        lines.append(f"  ✓ {item}")
-    if errors:
-        lines.append("")
-        lines.append(f"  ⚠️ Failed to store {len(errors)} items: {', '.join(errors[:3])}")
-
-    return "\n".join(lines)
-
-
-@mcp.tool()
-async def garza_memory_stats() -> str:
-    """
-    Show memory system health: total memories, type breakdown, recent activity,
-    and storage backend status.
-
-    Use this to audit the memory layer or check if memories are being stored correctly.
-    """
-    # Search for all garza-os memories
-    all_result = await fabric_call("fabric_memory_search", {
-        "query": "garza-os",
-        "limit": 100,
-    })
-
-    memories = all_result.get("memories", all_result.get("results", []))
-    total = all_result.get("total", len(memories))
-
-    if not memories and total == 0:
-        return (
-            "Memory system status: EMPTY\n"
-            "No memories stored yet. The Fabric.so connection is working but no data exists.\n"
-            "Use garza_remember() or garza_session_end() to start building memory."
-        )
-
-    # Type breakdown
-    type_counts: dict = {}
-    recent: list = []
-    for mem in memories:
-        mtype = mem.get("memory_type", mem.get("type", "unknown"))
-        type_counts[mtype] = type_counts.get(mtype, 0) + 1
-        created = mem.get("created_at", 0)
-        recent.append((created, mem))
-
-    recent.sort(key=lambda x: x[0], reverse=True)
-    recent_5 = recent[:5]
-
-    lines = [
-        "GARZA OS Memory System",
-        "=" * 30,
-        f"Total memories: {total}",
-        f"Retrieved: {len(memories)}",
-        "",
-        "Type breakdown:",
-    ]
-    for mtype, count in sorted(type_counts.items(), key=lambda x: -x[1]):
-        lines.append(f"  {mtype}: {count}")
-
-    if recent_5:
-        lines.extend(["", "Most recent memories:"])
-        for ts, mem in recent_5:
-            text = mem.get("content", mem.get("text", ""))[:80]
-            mtype = mem.get("memory_type", mem.get("type", "?"))
-            age = _human_time(ts) if ts else "unknown"
-            lines.append(f"  [{mtype}] {text} ({age})")
-
-    lines.extend([
-        "",
-        f"Backend: Fabric.so MCP ({_FABRIC_SO_URL})",
-        f"Session: {'active' if _fabric._session_id else 'not initialized'}",
-    ])
-
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Sprint 5 — Phase 5: Auto-Population Scanner
-# Scans last 100 completed tasks and extracts Pattern/Insight memories
-# ---------------------------------------------------------------------------
-
-
-@mcp.tool()
-async def garza_memory_populate(max_tasks: int = 50, dry_run: bool = True) -> str:
-    """
-    Scan recent completed tasks and auto-extract Pattern and Insight memories.
-
-    Analyzes task titles, durations, costs, and statuses to build a knowledge base
-    of what types of tasks Jaden runs, what they cost, and how long they take.
-
-    Args:
-        max_tasks: How many recent tasks to scan (default 50, max 100)
-        dry_run: If True, shows what would be stored without storing (default True)
-                 Set to False to actually store the memories
-    """
-    try:
-        max_tasks = min(max_tasks, 100)
-        tasks_resp = await manus_request("GET", "/tasks", params={"limit": max_tasks, "status": "completed"})
-        tasks = tasks_resp.get("data", [])
-
-        if not tasks:
-            return "No completed tasks found to analyze."
-
-        # Analyze patterns
-        total_cost = sum(t.get("credit_usage", 0) for t in tasks)
-        avg_cost = total_cost / len(tasks) if tasks else 0
-
-        # Group by rough category (first 3 words of prompt)
-        categories: dict = {}
-        expensive: list = []
-        fast: list = []
-
-        for t in tasks:
-            prompt = (t.get("prompt") or t.get("title") or "")[:100]
-            credits = t.get("credit_usage", 0)
-            cost_usd = credits / 200.0
-
-            # Categorize by first 3 words
-            words = prompt.lower().split()[:3]
-            cat = " ".join(words) if words else "unknown"
-            categories[cat] = categories.get(cat, 0) + 1
-
-            if cost_usd > 5.0:
-                expensive.append((cost_usd, prompt[:60]))
-            if cost_usd < 0.50 and credits > 0:
-                fast.append((cost_usd, prompt[:60]))
-
-        expensive.sort(reverse=True)
-        fast.sort()
-
-        # Build memories to store
-        memories_to_store = []
-
-        # Pattern: overall fleet stats
-        memories_to_store.append({
-            "tool": "agent_remember_insight",
-            "args": {
-                "content": (
-                    f"Fleet analysis: {len(tasks)} completed tasks analyzed. "
-                    f"Average cost: {_usd(avg_cost * 200)}. "
-                    f"Total spend: {_usd(total_cost)}. "
-                    f"Top expensive task: {expensive[0][1] if expensive else 'none'} at ${expensive[0][0]:.2f}."
-                ),
-                "importance": 0.6,
-                "tags": ["fleet-analysis", "cost-pattern", "garza-os"],
-            }
-        })
-
-        # Pattern: expensive task types
-        if expensive[:3]:
-            exp_str = "; ".join(f"'{t[1]}' (${t[0]:.2f})" for t in expensive[:3])
-            memories_to_store.append({
-                "tool": "agent_remember_insight",
-                "args": {
-                    "content": f"Most expensive task types: {exp_str}. These are candidates for optimization.",
-                    "importance": 0.65,
-                    "tags": ["cost-pattern", "expensive-tasks", "garza-os"],
-                }
-            })
-
-        # Pattern: fast/cheap task types
-        if fast[:3]:
-            fast_str = "; ".join(f"'{t[1]}' (${t[0]:.2f})" for t in fast[:3])
-            memories_to_store.append({
-                "tool": "agent_remember_insight",
-                "args": {
-                    "content": f"Fastest/cheapest task types: {fast_str}. These are efficient patterns.",
-                    "importance": 0.5,
-                    "tags": ["cost-pattern", "efficient-tasks", "garza-os"],
-                }
-            })
-
-        # Pattern: most common task categories
-        top_cats = sorted(categories.items(), key=lambda x: -x[1])[:5]
-        if top_cats:
-            cats_str = ", ".join(f"'{k}' ({v}x)" for k, v in top_cats)
-            memories_to_store.append({
-                "tool": "agent_remember_insight",
-                "args": {
-                    "content": f"Most common task categories: {cats_str}. These represent Jaden's primary use cases.",
-                    "importance": 0.6,
-                    "tags": ["task-pattern", "usage-analysis", "garza-os"],
-                }
-            })
-
-        lines = [
-            f"Memory Population Scan — {len(tasks)} completed tasks analyzed",
-            f"{'DRY RUN — nothing stored' if dry_run else 'LIVE RUN — storing memories'}",
-            "",
-            f"Fleet stats: avg cost {_usd(avg_cost * 200)}, total {_usd(total_cost)}",
-            f"Expensive tasks (>${5:.0f}): {len(expensive)}",
-            f"Fast tasks (<$0.50): {len(fast)}",
-            f"Unique categories: {len(categories)}",
-            "",
-            f"Memories to store: {len(memories_to_store)}",
-        ]
-
-        if not dry_run:
-            stored = 0
-            for m in memories_to_store:
-                r = await fabric_call(m["tool"], m["args"])
-                if r:
-                    stored += 1
-            lines.append(f"✅ Stored {stored}/{len(memories_to_store)} memories")
-        else:
-            lines.append("")
-            lines.append("Would store:")
-            for m in memories_to_store:
-                lines.append(f"  • {m['args']['content'][:100]}")
-            lines.append("")
-            lines.append("Run with dry_run=False to store these memories.")
-
-        return "\n".join(lines)
-
     except Exception as e:
         return handle_api_error(e)
