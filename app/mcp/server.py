@@ -633,38 +633,25 @@ async def manus_get_task(task_id: str) -> str:
 async def manus_list_tasks(
     limit: int = 50,
     status_filter: str = "",
-    paginate: bool = True,
+    paginate: bool = False,
 ) -> str:
     """
     List recent Manus tasks with credit usage, timing, and prompt context.
-    Paginates automatically to reach the requested limit (max 500).
+    The Manus API supports limit up to 100 per request.
 
     Args:
-        limit: Number of tasks to return (default 50, max 500)
+        limit: Number of tasks to return (default 50, max 100)
         status_filter: Optional filter — pending | running | completed | failed
-        paginate: If True (default), fetch multiple pages to reach limit
+        paginate: Unused (reserved for future API support)
     """
     try:
-        effective_limit = min(max(1, limit), 500)
+        effective_limit = min(max(1, limit), 100)
         tasks = []
-        page = 1
-        while len(tasks) < effective_limit:
-            batch_size = min(100, effective_limit - len(tasks))
-            params: dict = {"limit": batch_size, "page": page}
-            if status_filter:
-                params["status"] = status_filter
-            result = await manus_request("GET", "/tasks", params=params)
-            batch = result.get("tasks", result.get("data", []))
-            if not batch:
-                break
-            tasks.extend(batch)
-            has_more = result.get("has_more", False)
-            if not paginate or not has_more or len(batch) < batch_size:
-                break
-            page += 1
-            if page > 10:
-                break
-
+        params: dict = {"limit": effective_limit}
+        if status_filter:
+            params["status"] = status_filter
+        result = await manus_request("GET", "/tasks", params=params)
+        tasks = result.get("tasks", result.get("data", []))
         if not tasks:
             return "No tasks found."
 
