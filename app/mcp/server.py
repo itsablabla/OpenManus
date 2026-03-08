@@ -850,8 +850,33 @@ class FabricClient:
                         pass
         return {}
 
+    _HEADERS = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+
+    # Map from our generic "content" param to each tool's required field name
+    _PARAM_MAP: dict = {
+        "agent_remember_insight":    lambda args: {"insight": args.pop("content", args.get("insight", "")), **{k: v for k, v in args.items() if k != "insight"}},
+        "agent_remember_decision":   lambda args: {"decision": args.pop("content", args.get("decision", "")), **{k: v for k, v in args.items() if k != "decision"}},
+        "agent_remember_context":    lambda args: {"context": args.pop("content", args.get("context", "")), **{k: v for k, v in args.items() if k != "context"}},
+        "agent_remember_preference": lambda args: {
+            "subject": args.pop("subject", "Jaden"),
+            "preference": args.pop("content", args.pop("preference", "")),
+            **{k: v for k, v in args.items() if k not in ("subject", "preference")}
+        },
+    }
+
+    def _normalize_args(self, tool_name: str, arguments: dict) -> dict:
+        """Map generic 'content' param to the tool-specific required field."""
+        args = dict(arguments)  # copy
+        mapper = self._PARAM_MAP.get(tool_name)
+        if mapper:
+            try:
+                return mapper(args)
+            except Exception:
+                pass
+        return args
+
     async def _initialize(self, client) -> bool:
-        """Perform the MCP initialize handshake. Returns True on success."""
+        """Perform the MCP initialize handshake + notifications/initialized. Returns True on success."""
         try:
             resp = await client.post(
                 _FABRIC_SO_URL,
@@ -865,12 +890,24 @@ class FabricClient:
                         "clientInfo": {"name": "garza-os-mcp", "version": "1.0"},
                     },
                 },
-                headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
+                headers=self._HEADERS,
             )
             if resp.status_code == 200:
                 self._session_id = resp.headers.get("Mcp-Session-Id")
+                if not self._session_id:
+                    logger.warning("[fabric] No session ID in initialize response")
+                    return False
                 logger.info("[fabric] Initialized session: %s", self._session_id)
-                return bool(self._session_id)
+                # Send notifications/initialized (required by MCP spec)
+                try:
+                    await client.post(
+                        _FABRIC_SO_URL,
+                        json={"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
+                        headers={**self._HEADERS, "Mcp-Session-Id": self._session_id},
+                    )
+                except Exception:
+                    pass  # Non-critical
+                return True
             logger.warning("[fabric] Initialize failed: %s", resp.status_code)
         except Exception as e:
             logger.warning("[fabric] Initialize error: %s", e)
@@ -881,6 +918,8 @@ class FabricClient:
         if not _FABRIC_SO_URL:
             return {}
         import httpx
+        # Normalize arguments to match each tool's required parameter names
+        normalized = self._normalize_args(tool_name, arguments)
         async with self._lock:
             try:
                 async with httpx.AsyncClient(timeout=15.0) as client:
@@ -890,19 +929,17 @@ class FabricClient:
                             return {}
 
                     req_id = self._next_id()
+                    call_headers = {**self._HEADERS, "Mcp-Session-Id": self._session_id}
+
                     resp = await client.post(
                         _FABRIC_SO_URL,
                         json={
                             "jsonrpc": "2.0",
                             "id": req_id,
                             "method": "tools/call",
-                            "params": {"name": tool_name, "arguments": arguments},
+                            "params": {"name": tool_name, "arguments": normalized},
                         },
-                        headers={
-                            "Content-Type": "application/json",
-                            "Accept": "application/json, text/event-stream",
-                            "Mcp-Session-Id": self._session_id,
-                        },
+                        headers=call_headers,
                     )
 
                     # Session expired — reinitialize and retry once
@@ -912,27 +949,29 @@ class FabricClient:
                         if not await self._initialize(client):
                             return {}
                         req_id = self._next_id()
+                        call_headers = {**self._HEADERS, "Mcp-Session-Id": self._session_id}
                         resp = await client.post(
                             _FABRIC_SO_URL,
                             json={
                                 "jsonrpc": "2.0",
                                 "id": req_id,
                                 "method": "tools/call",
-                                "params": {"name": tool_name, "arguments": arguments},
+                                "params": {"name": tool_name, "arguments": normalized},
                             },
-                            headers={
-                                "Content-Type": "application/json",
-                                "Accept": "application/json, text/event-stream",
-                                "Mcp-Session-Id": self._session_id,
-                            },
+                            headers=call_headers,
                         )
 
                     if resp.status_code != 200:
-                        logger.warning("[fabric] %s returned %s", tool_name, resp.status_code)
+                        logger.warning("[fabric] %s returned %s: %s", tool_name, resp.status_code, resp.text[:200])
                         return {}
 
                     envelope = self._parse_sse(resp.text)
                     result = envelope.get("result", {})
+
+                    # Check for tool-level errors
+                    if envelope.get("error"):
+                        logger.warning("[fabric] %s error: %s", tool_name, envelope["error"])
+                        return {}
 
                     # Extract structured content if available
                     if "structuredContent" in result:
@@ -942,12 +981,16 @@ class FabricClient:
                     content = result.get("content", [])
                     if content and isinstance(content, list):
                         text = content[0].get("text", "")
+                        # Check if tool returned an error in text
+                        if "validation error" in text.lower() or "missing required" in text.lower():
+                            logger.warning("[fabric] %s validation error: %s", tool_name, text[:200])
+                            return {}
                         try:
                             return json.loads(text)
                         except json.JSONDecodeError:
-                            return {"text": text}
+                            return {"text": text, "success": True}
 
-                    return result
+                    return result if result else {"success": True}
 
             except Exception as e:
                 logger.warning("[fabric] %s failed: %s", tool_name, e)
