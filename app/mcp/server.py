@@ -40,7 +40,7 @@ from app.mcp.manus_models import (
 )
 
 logger = logging.getLogger(__name__)
-mcp = FastMCP("OpenManus Hybrid MCP Server v19 — Read-Only Task Management")
+mcp = FastMCP("OpenManus Hybrid MCP Server v20 — Task Advancement Engine")
 
 # ---------------------------------------------------------------------------
 # Credit → USD conversion
@@ -3448,5 +3448,468 @@ async def garza_memory_inject(context_hint: str = "", limit: int = 8) -> str:
         "Inject this block into your system prompt or prepend to task context.",
         "Call garza_remember() to add new memories during this session.",
     ])
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Sprint 7 — Task Advancement Engine
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def manus_task_read_conversation(task_id: str, last_n: int = 0) -> str:
+    """
+    Read the full conversation from a Manus task — what it's saying, what it's asking for,
+    and whether it's blocked.
+
+    Use this before manus_task_unblock or manus_task_advance to understand what a task needs.
+
+    Args:
+        task_id: The Manus task ID to read
+        last_n: If >0, only show the last N messages (default 0 = show all)
+    """
+    try:
+        detail = await manus_request("GET", f"/tasks/{task_id}")
+    except Exception as e:
+        return handle_api_error(e)
+
+    status = detail.get("status", "unknown")
+    output = detail.get("output", [])
+    meta = detail.get("metadata") or {}
+    title = meta.get("task_title", task_id)
+    credits = detail.get("credit_usage", 0)
+
+    # Parse messages from output[]
+    messages = []
+    for item in output:
+        role = item.get("role", "unknown")
+        content_list = item.get("content") or []
+        for c in content_list:
+            if c.get("type") == "output_text":
+                text = c.get("text", "").strip()
+                if text:
+                    messages.append({"role": role, "text": text})
+
+    if last_n > 0:
+        messages = messages[-last_n:]
+
+    # Detect blocker in last assistant message
+    last_assistant = ""
+    for m in reversed(messages):
+        if m["role"] == "assistant":
+            last_assistant = m["text"]
+            break
+
+    import re as _re
+    blocker_type = "none"
+    blocker_detail = ""
+    if last_assistant:
+        for btype, patterns in BLOCKER_PATTERNS.items():
+            for pattern in patterns:
+                if _re.search(pattern, last_assistant, _re.IGNORECASE):
+                    blocker_type = btype
+                    blocker_detail = last_assistant[:300]
+                    break
+            if blocker_type != "none":
+                break
+
+    lines = [
+        f"Task: {title}",
+        f"ID: {task_id}",
+        f"Status: {status} | Credits: {_usd(credits if isinstance(credits, (int, float)) else 0)}",
+        f"Messages: {len(messages)}",
+        "",
+        "=== CONVERSATION ===",
+    ]
+
+    for i, m in enumerate(messages, 1):
+        role_label = "USER" if m["role"] == "user" else "MANUS"
+        lines.append(f"\n[{i}] {role_label}")
+        lines.append(m["text"][:500] + ("..." if len(m["text"]) > 500 else ""))
+
+    lines.extend([
+        "",
+        "=== LAST MESSAGE ===",
+        last_assistant[:600] if last_assistant else "(no assistant messages yet)",
+        "",
+        "=== BLOCKER DETECTION ===",
+        f"Type: {blocker_type}",
+    ])
+    if blocker_detail:
+        lines.append(f"Detail: {blocker_detail[:200]}")
+
+    if blocker_type == "waiting_human":
+        lines.extend(["", "-> Call manus_task_unblock(task_id, answer='your reply') to continue this task."])
+    elif blocker_type != "none":
+        lines.extend(["", "-> Call manus_task_advance(task_id) to auto-unblock using memory."])
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def manus_task_unblock(
+    task_id: str,
+    answer: str,
+    additional_context: str = "",
+    include_full_history: bool = True,
+) -> str:
+    """
+    Reply to a blocked task by creating a context-aware continuation task.
+
+    Since the Manus API does not support mid-task replies, this creates a new task
+    with the full conversation history + your answer baked into the prompt.
+    The new task picks up exactly where the old one left off.
+
+    Args:
+        task_id: The blocked task to continue
+        answer: Your reply — the information, credentials, or decision the task needs
+        additional_context: Optional extra context to inject (e.g., related docs, links)
+        include_full_history: If True (default), include full conversation in new prompt.
+                              Set False for very long tasks to keep prompt concise.
+    """
+    try:
+        detail = await manus_request("GET", f"/tasks/{task_id}")
+    except Exception as e:
+        return handle_api_error(e)
+
+    status = detail.get("status", "unknown")
+    output = detail.get("output", [])
+    meta = detail.get("metadata") or {}
+    title = meta.get("task_title", task_id)
+
+    # Extract original user prompt (first user message)
+    original_prompt = ""
+    for item in output:
+        if item.get("role") == "user":
+            for c in (item.get("content") or []):
+                if c.get("type") == "output_text":
+                    original_prompt = c.get("text", "")
+                    break
+        if original_prompt:
+            break
+
+    # Build conversation transcript
+    transcript_lines = []
+    if include_full_history:
+        for item in output:
+            role = item.get("role", "?")
+            role_label = "USER" if role == "user" else "MANUS"
+            for c in (item.get("content") or []):
+                if c.get("type") == "output_text":
+                    text = c.get("text", "").strip()
+                    if text:
+                        transcript_lines.append(f"[{role_label}]: {text[:800]}")
+
+    # Build continuation prompt
+    parts = [
+        f"CONTINUATION -- Picking up from task {task_id}: {title}",
+        "",
+        "=== ORIGINAL GOAL ===",
+        original_prompt or f"Complete the task: {title}",
+    ]
+
+    if transcript_lines:
+        parts.extend([
+            "",
+            "=== CONVERSATION HISTORY ===",
+            "\n".join(transcript_lines[-20:]),  # last 20 exchanges max
+        ])
+
+    parts.extend([
+        "",
+        "=== USER REPLY ===",
+        answer,
+    ])
+
+    if additional_context:
+        parts.extend([
+            "",
+            "=== ADDITIONAL CONTEXT ===",
+            additional_context,
+        ])
+
+    parts.extend([
+        "",
+        "=== INSTRUCTIONS ===",
+        "Continue from where the previous task left off.",
+        "The user has provided the information above.",
+        "Use it to complete the original goal.",
+        "Do not ask for information that was already provided above.",
+    ])
+
+    continuation_prompt = "\n".join(parts)
+
+    # Create continuation task
+    try:
+        resp = await manus_request("POST", "/tasks", json={
+            "prompt": continuation_prompt,
+            "taskMode": "agent",
+            "agentProfile": "manus-1.6",
+            "parent_id": task_id,
+        })
+    except Exception as e:
+        return handle_api_error(e)
+
+    new_task_id = resp.get("task_id", resp.get("id", "unknown"))
+    new_task_url = resp.get("task_url", f"https://manus.im/app/{new_task_id}")
+
+    # Store handoff in memory (fire and forget)
+    asyncio.ensure_future(fabric_call("agent_remember", {
+        "content": (
+            f"Task handoff: {task_id} -> {new_task_id}. "
+            f"Title: {title}. "
+            f"Injected: {answer[:100]}"
+        ),
+        "importance": 0.8,
+        "tags": ["task-handoff", "task-advancement", "garza-os"],
+    }))
+
+    return "\n".join([
+        "Task continuation created",
+        "",
+        f"Original task : {task_id} ({status})",
+        f"Title         : {title}",
+        f"Your answer   : {answer[:120]}{'...' if len(answer) > 120 else ''}",
+        "",
+        f"New task ID   : {new_task_id}",
+        f"URL           : {new_task_url}",
+        "",
+        f"History included : {'Yes (' + str(len(transcript_lines)) + ' exchanges)' if transcript_lines else 'No'}",
+        "",
+        f"Tip: Call manus_get_task(task_id='{new_task_id}') in 2-3 min to check progress.",
+    ])
+
+
+@mcp.tool()
+async def manus_task_advance(
+    task_id: str,
+    hint: str = "",
+    dry_run: bool = False,
+) -> str:
+    """
+    Autonomously unblock a stuck task using memory, AI reasoning, and pattern matching.
+    No human input required — it figures out what the task needs and injects it from memory.
+
+    Steps:
+    1. Reads the full task conversation
+    2. Detects what the task is blocked on (credentials, clarification, tool, etc.)
+    3. Searches Fabric.so memory for relevant context using garza_learn
+    4. Constructs the best possible continuation prompt
+    5. Creates a continuation task (or dry-run preview)
+
+    Args:
+        task_id: The stuck task to advance
+        hint: Optional hint to guide memory search (e.g., 'check Namecheap credentials')
+        dry_run: If True, shows what it would do without creating a task
+    """
+    try:
+        detail = await manus_request("GET", f"/tasks/{task_id}")
+    except Exception as e:
+        return handle_api_error(e)
+
+    status = detail.get("status", "unknown")
+    output = detail.get("output", [])
+    meta = detail.get("metadata") or {}
+    title = meta.get("task_title", task_id)
+
+    # Extract conversation
+    last_assistant = ""
+    original_prompt = ""
+    transcript_lines = []
+
+    for item in output:
+        role = item.get("role", "?")
+        for c in (item.get("content") or []):
+            if c.get("type") == "output_text":
+                text = c.get("text", "").strip()
+                if text:
+                    role_label = "USER" if role == "user" else "MANUS"
+                    transcript_lines.append(f"[{role_label}]: {text[:600]}")
+                    if role == "user" and not original_prompt:
+                        original_prompt = text
+                    if role == "assistant":
+                        last_assistant = text
+
+    # Detect blocker
+    import re as _re2
+    blocker_type = "none"
+    blocker_detail = last_assistant[:400] if last_assistant else ""
+
+    for btype, patterns in BLOCKER_PATTERNS.items():
+        for pattern in patterns:
+            if _re2.search(pattern, last_assistant, _re2.IGNORECASE):
+                blocker_type = btype
+                break
+        if blocker_type != "none":
+            break
+
+    # Build memory search query
+    if hint:
+        search_query = hint
+    elif blocker_detail:
+        search_query = blocker_detail[:200]
+    else:
+        search_query = f"{title} context credentials"
+
+    # Search memory
+    memory_result = await garza_learn(query=search_query, limit=5)
+    memory_found = bool(
+        memory_result
+        and "No memories found" not in memory_result
+        and "not configured" not in memory_result
+    )
+
+    # Determine confidence
+    if memory_found and blocker_type != "none":
+        confidence = 0.85
+        answer_source = "memory (exact blocker match)"
+    elif memory_found:
+        confidence = 0.65
+        answer_source = "memory (partial match)"
+    else:
+        confidence = 0.30
+        answer_source = "no memory found -- generic continuation"
+        memory_result = f"No relevant memory found for: {search_query}"
+
+    # Build continuation prompt
+    parts = [
+        f"CONTINUATION -- Auto-advancing task {task_id}: {title}",
+        "",
+        "=== ORIGINAL GOAL ===",
+        original_prompt or f"Complete the task: {title}",
+    ]
+
+    if transcript_lines:
+        parts.extend([
+            "",
+            "=== CONVERSATION HISTORY ===",
+            "\n".join(transcript_lines[-15:]),
+        ])
+
+    parts.extend([
+        "",
+        "=== CONTEXT FROM GARZA OS MEMORY ===",
+        memory_result[:1500] if memory_result else "(none found)",
+        "",
+        "=== INSTRUCTIONS ===",
+        "Continue from where the previous task left off.",
+        "Use the memory context above to resolve any blockers.",
+        "If the context above contains credentials or answers, use them directly.",
+        "Complete the original goal.",
+    ])
+
+    continuation_prompt = "\n".join(parts)
+
+    # Build response
+    lines = [
+        f"GARZA OS -- Auto-Advance: {task_id}",
+        "",
+        f"Task     : {title}",
+        f"Status   : {status}",
+        f"Blocker  : {blocker_type}",
+        f"Detail   : {blocker_detail[:200] if blocker_detail else 'none detected'}",
+        "",
+        f"Memory search: '{search_query[:100]}'",
+        f"Memory found : {'Yes' if memory_found else 'No'}",
+        f"Answer source: {answer_source}",
+        f"Confidence   : {confidence:.0%}",
+    ]
+
+    if dry_run:
+        lines.extend([
+            "",
+            "=== DRY RUN -- No task created ===",
+            "Continuation prompt preview:",
+            continuation_prompt[:800] + "...",
+            "",
+            "Run with dry_run=False to create the continuation task.",
+        ])
+        return "\n".join(lines)
+
+    # Create continuation task
+    try:
+        resp = await manus_request("POST", "/tasks", json={
+            "prompt": continuation_prompt,
+            "taskMode": "agent",
+            "agentProfile": "manus-1.6",
+            "parent_id": task_id,
+        })
+    except Exception as e:
+        return handle_api_error(e)
+
+    new_task_id = resp.get("task_id", resp.get("id", "unknown"))
+    new_task_url = resp.get("task_url", f"https://manus.im/app/{new_task_id}")
+
+    # Store handoff in memory
+    asyncio.ensure_future(fabric_call("agent_remember", {
+        "content": (
+            f"Auto-advance: {task_id} -> {new_task_id}. "
+            f"Blocker: {blocker_type}. "
+            f"Source: {answer_source}. "
+            f"Confidence: {confidence:.0%}."
+        ),
+        "importance": 0.75,
+        "tags": ["task-handoff", "task-advance", "auto-advance", "garza-os"],
+    }))
+
+    lines.extend([
+        "",
+        "Continuation task created",
+        f"New task ID : {new_task_id}",
+        f"URL         : {new_task_url}",
+        "",
+        f"Tip: Call manus_get_task(task_id='{new_task_id}') in 2-3 min to check progress.",
+    ])
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def manus_task_handoff_log(task_id: str = "", limit: int = 20) -> str:
+    """
+    View the history of all task handoffs — parent -> child task chains created by
+    manus_task_unblock and manus_task_advance.
+
+    Args:
+        task_id: If provided, filter to handoffs involving this task ID.
+                 If empty, show all recent handoffs.
+        limit: Max handoffs to show (default 20)
+    """
+    query = f"task handoff {task_id}" if task_id else "task handoff task-advancement"
+    result = await fabric_call("fabric_memory_search", {"query": query, "limit": limit})
+    hits = result.get("hits", [])
+
+    # Filter to only handoff memories
+    handoffs = [
+        h for h in hits
+        if any(
+            kw in (h.get("name", "") + h.get("content", "")).lower()
+            for kw in ["handoff", "task-advance", "continuation", "auto-advance"]
+        )
+    ]
+
+    if not handoffs:
+        return (
+            "No task handoffs recorded yet.\n"
+            "Handoffs are created when you call manus_task_unblock() or manus_task_advance()."
+        )
+
+    lines = [
+        f"Task Handoff Log -- {len(handoffs)} records",
+        "=" * 50,
+        "",
+    ]
+
+    for i, h in enumerate(handoffs, 1):
+        content = h.get("content", h.get("name", ""))
+        created = h.get("createdAt", "")
+        age = _human_time(created) if created else ""
+        lines.append(f"{i}. {content[:200]}")
+        if age:
+            lines.append(f"   ({age})")
+        lines.append("")
+
+    if task_id:
+        lines.append(f"Filtered to task: {task_id}")
 
     return "\n".join(lines)
