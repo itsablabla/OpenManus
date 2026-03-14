@@ -20,6 +20,9 @@ RUN uv pip install --system -r requirements.txt
 # Install Playwright browsers
 RUN playwright install chromium --with-deps 2>/dev/null || true
 
+# Cache bust: increment to force fresh COPY of application code
+ARG CACHE_BUST=4
+
 # Copy application code
 COPY . .
 
@@ -31,5 +34,4 @@ EXPOSE 8000
 
 # Start the web server
 CMD ["python", "server.py"]
-# Cache bust: force rebuild with latest code
-LABEL cache_bust="2026-03-14-v3"
+
