@@ -15,12 +15,34 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 
-# Patch config before importing OpenManus modules
-# Override API key from environment variable
-import app.config as _cfg_module
+# ── Runtime patch: fix DaytonaSettings BEFORE importing app.config ──
+# Railway may serve a cached build where daytona_api_key is still required.
+# We patch the source file in-place at container startup to make it optional.
+import re as _re
 
-_original_get_config = None
+def _patch_daytona_config():
+    """Make DaytonaSettings.daytona_api_key optional at runtime."""
+    config_py = os.path.join(os.path.dirname(__file__), "app", "config.py")
+    if not os.path.exists(config_py):
+        return
+    with open(config_py, "r") as f:
+        src = f.read()
+    # Fix 1: make daytona_api_key optional
+    src = src.replace(
+        "    daytona_api_key: str\n",
+        '    daytona_api_key: Optional[str] = Field(None, description="Daytona API key (optional)")\n'
+    )
+    # Fix 2: don't instantiate DaytonaSettings() with no args when no config
+    src = src.replace(
+        "            daytona_settings = DaytonaSettings()\n",
+        "            daytona_settings = None\n"
+    )
+    with open(config_py, "w") as f:
+        f.write(src)
 
+_patch_daytona_config()
+
+# Patch config to use environment variables for API key
 def _patch_config():
     """Patch the config to use environment variables for API key."""
     config_path = os.path.join(os.path.dirname(__file__), "config", "config.toml")
@@ -33,6 +55,8 @@ def _patch_config():
             f.write(content)
 
 _patch_config()
+
+import app.config as _cfg_module
 
 from app.agent.manus import Manus
 from app.logger import logger
