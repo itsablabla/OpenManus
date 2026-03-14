@@ -31,3 +31,5 @@ EXPOSE 8000
 
 # Start the web server
 CMD ["python", "server.py"]
+# Cache bust: force rebuild with latest code
+LABEL cache_bust="2026-03-14-v3"
