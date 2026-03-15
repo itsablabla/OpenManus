@@ -1,0 +1,26 @@
+# fly.toml — OpenManus on Fly.io
+# Powered by CUDOS ASI Cloud inference
+
+app = "openmanus-garza"
+primary_region = "dfw"
+
+[build]
+  dockerfile = "Dockerfile.railway"
+
+[env]
+  PORT = "8000"
+  PYTHONUNBUFFERED = "1"
+  OPENAI_BASE_URL = "https://inference.asicloud.cudos.org/v1"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["app"]
+
+[[vm]]
+  memory = "2gb"
+  cpu_kind = "shared"
+  cpus = 2

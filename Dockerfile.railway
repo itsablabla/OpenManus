@@ -21,7 +21,7 @@ RUN uv pip install --system -r requirements.txt
 RUN playwright install chromium --with-deps 2>/dev/null || true
 
 # Cache bust: increment to force fresh COPY of application code
-ARG CACHE_BUST=4
+ARG CACHE_BUST=5
 
 # Copy application code
 COPY . .
